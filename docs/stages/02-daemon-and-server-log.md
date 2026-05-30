@@ -190,4 +190,3 @@ stage 02: daemonize server and write server log
 
 Do not commit `.DS_Store`.
 Do not commit local HTML walkthrough files.
-

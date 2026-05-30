@@ -23,6 +23,13 @@ PASS="1234"
 
 SERVER_PID=""
 
+# 只匹配“命令行里同时含本 $SERVER 绝对路径和本 $CONF 绝对路径”的进程，
+# 用 index() 做子串精确匹配，避免误伤同名但不同实例/配置的 chatserver。
+find_server_pids() {
+    ps -axo pid,args 2>/dev/null | awk -v s="$SERVER" -v c="$CONF" '
+        index($0, s) > 0 && index($0, c) > 0 { print $1 }'
+}
+
 fail() {
     echo "STAGE 02 FAIL: $*"
     echo "---- tail of $SERVER_LOG ----" >&2
@@ -56,8 +63,8 @@ if ! sudo -n true 2>/dev/null; then
     fi
 fi
 
-# 2. 清场：杀掉残留 daemon，删掉残留公共 FIFO。
-OLD_PIDS=$(pgrep -f "bin/chatserver_${SHORT}_${VER}" || true)
+# 2. 清场：杀掉残留 daemon（仅本 server+本 conf 的实例），删掉残留公共 FIFO。
+OLD_PIDS=$(find_server_pids || true)
 if [[ -n "$OLD_PIDS" ]]; then
     echo "[smoke] killing stale server: $OLD_PIDS"
     # shellcheck disable=SC2086
@@ -68,11 +75,11 @@ sudo rm -f "$FIFO_DIR"/* "$DATA_DIR/client_fifo/$USER" 2>/dev/null || true
 
 # 3. 用 sudo 启动服务器；它会 fork+setsid 守护化，父进程立即退出。
 sudo "$SERVER" "$CONF" || fail "server failed to launch"
-sleep 0.6
+sleep 1
 
-# 4. 守护化后父进程已退出，必须用 pgrep 找真正的 daemon pid（不是 $!）。
-SERVER_PID=$(pgrep -f "bin/chatserver_${SHORT}_${VER}" | head -n1)
-[[ -n "$SERVER_PID" ]] || fail "daemon pid not found via pgrep"
+# 4. 守护化后父进程已退出，必须按 server+conf 精确定位真正的 daemon pid（不是 $!）。
+SERVER_PID=$(find_server_pids | head -n1)
+[[ -n "$SERVER_PID" ]] || fail "daemon pid not found (server=$SERVER conf=$CONF)"
 echo "[smoke] daemon pid = $SERVER_PID"
 ps -o pid,ppid,comm -p "$SERVER_PID" 2>/dev/null || true
 
@@ -83,13 +90,13 @@ for name in lwjregister lwjlogin lwjsendmsg lwjlogout; do
 done
 echo "[smoke] 4 FIFOs OK:"; ls -l "$FIFO_DIR"
 
-# 6. 注册 → 期望 register ok。
-OUT_REG=$( ( echo "/register"; sleep 0.4; echo "/quit" ) | "$CLIENT" "$CONF" "$USER" "$PASS" 2>&1 || true )
+# 6. 注册 → 期望 register ok。sleep 放宽到 1s，避免客户端在服务器回包前就 /quit unlink 私有 FIFO。
+OUT_REG=$( ( echo "/register"; sleep 1; echo "/quit" ) | "$CLIENT" "$CONF" "$USER" "$PASS" 2>&1 || true )
 echo "$OUT_REG" | grep -q "OK: register ok" || fail "register did not succeed; output: $OUT_REG"
 echo "[smoke] register ok"
 
 # 7. 登录 → 登出 → 期望两条 OK。
-OUT_LOGIN=$( ( echo "/login"; sleep 0.4; echo "/logout"; sleep 0.4; echo "/quit" ) | "$CLIENT" "$CONF" "$USER" "$PASS" 2>&1 || true )
+OUT_LOGIN=$( ( echo "/login"; sleep 1; echo "/logout"; sleep 1; echo "/quit" ) | "$CLIENT" "$CONF" "$USER" "$PASS" 2>&1 || true )
 echo "$OUT_LOGIN" | grep -q "OK: login ok"  || fail "login did not succeed; output: $OUT_LOGIN"
 echo "$OUT_LOGIN" | grep -q "OK: logout ok" || fail "logout did not succeed; output: $OUT_LOGIN"
 echo "[smoke] login + logout ok"
@@ -98,7 +105,7 @@ echo "[smoke] login + logout ok"
 sudo test -f "$SERVER_LOG" || fail "server.log not found: $SERVER_LOG"
 MODE=$(sudo stat -c %a "$SERVER_LOG" 2>/dev/null || sudo stat -f %Lp "$SERVER_LOG" 2>/dev/null || echo "?")
 echo "[smoke] server.log mode = $MODE"
-[[ "$MODE" == "600" ]] || echo "[smoke] WARN: server.log mode is $MODE (expected 600)"
+[[ "$MODE" == "600" ]] || fail "server.log mode is $MODE (expected 600)"
 
 LOGTXT=$(sudo cat "$SERVER_LOG" 2>/dev/null || true)
 for needle in "server starting" "ready" "registered user: $USER" "login user: $USER" "logout user: $USER"; do

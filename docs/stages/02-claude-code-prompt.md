@@ -55,4 +55,3 @@ At the end, print:
 - key design choices
 - commands run and results
 - commit hash
-

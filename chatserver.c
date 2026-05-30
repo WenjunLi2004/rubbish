@@ -46,6 +46,11 @@ static int        hold_fds[FIFO_COUNT] = {-1, -1, -1, -1};
 static const char *fifo_paths[FIFO_COUNT];
 static int        g_log_fd = -1;   /* server.log 的写句柄，守护化后唯一可靠的输出 */
 
+/* 关闭标志：信号处理器里只允许触碰 volatile sig_atomic_t，
+ * 真正的日志与 FIFO 清理推迟到主循环上下文执行。 */
+static volatile sig_atomic_t g_shutdown_requested = 0;
+static volatile sig_atomic_t g_shutdown_signal = 0;
+
 /*
  * 统一日志：守护化后 stdout/stderr 已重定向到 /dev/null，printf/perror 会被丢弃，
  * 因此所有诊断都改走这里。日志句柄尚未打开时（如创建日志目录失败）退回到 stderr，
@@ -157,6 +162,15 @@ static int open_server_log(const ChatConfig *cfg)
                     cfg->server_log_path, strerror(errno));
         return -1;
     }
+
+    /* open 的 mode 仅在文件“新建”时生效；若 server.log 已存在且权限较松
+     * （如 0644），必须用 fchmod 强制收紧到 0600，保证“日志只许特权进程写”。 */
+    if (fchmod(g_log_fd, 0600) == -1)
+    {
+        log_message("ERROR", "fchmod %s 0600 failed: %s",
+                    cfg->server_log_path, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -214,9 +228,23 @@ static void cleanup(int status)
     exit(status);
 }
 
+/*
+ * 信号处理器只做异步信号安全的事：记录信号号、置位关闭标志。
+ * 不在信号上下文里调用 log_message()/cleanup()——它们涉及 write、unlink、
+ * exit 等非严格可重入操作。实际关闭由主循环的 shutdown_if_requested() 完成。
+ */
 static void handle_signal(int sig)
 {
-    log_message("INFO", "received signal %d, shutting down", sig);
+    g_shutdown_signal = sig;
+    g_shutdown_requested = 1;
+}
+
+/* 主循环上下文里真正执行关闭：记录信号、清理 4 个公共 FIFO、正常退出。 */
+static void shutdown_if_requested(void)
+{
+    if (!g_shutdown_requested) return;
+    log_message("INFO", "received signal %d, shutting down",
+                (int)g_shutdown_signal);
     cleanup(EXIT_SUCCESS);
 }
 
@@ -545,10 +573,18 @@ int main(int argc, char *argv[])
 
         if (select(maxfd + 1, &rfds, NULL, NULL, NULL) == -1)
         {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+            {
+                /* select 被信号打断：先看是不是收到了关闭信号。 */
+                shutdown_if_requested();
+                continue;
+            }
             log_message("ERROR", "select failed: %s", strerror(errno));
             cleanup(EXIT_FAILURE);
         }
+
+        /* select 正常返回后也检查一次，保证关闭及时。 */
+        shutdown_if_requested();
 
         if (FD_ISSET(read_fds[FIFO_REGISTER], &rfds)) drain_auth_fifo(read_fds[FIFO_REGISTER], 1);
         if (FD_ISSET(read_fds[FIFO_LOGIN], &rfds))    drain_auth_fifo(read_fds[FIFO_LOGIN], 0);
