@@ -1,0 +1,16 @@
+# 编译产物
+bin/
+
+# 运行时数据
+data/
+
+# smoke 中间产物
+scripts/smoke/.smoke.log
+scripts/smoke/.server.log
+
+# 本地 walkthrough / 讲解页面
+*.html
+
+# 编辑器
+.vscode/
+*.swp
