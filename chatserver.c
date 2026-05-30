@@ -1,16 +1,19 @@
 /*
  * chatserver.c
  *
- * 多用户聊天系统服务器（阶段 01）。
- * 配置文件读入 ChatConfig，创建 4 个公共 FIFO，select() 单线程主循环。
- * 业务处理函数（注册/登录/聊天/登出）保持单线程同步执行；
- * 多线程化、共享内存、守护进程化等留到后续阶段。
+ * 多用户聊天系统服务器（阶段 02）。
+ * 在阶段 01 的基础上把服务器守护进程化（daemon），并把启动、退出、
+ * 致命错误以及注册/登录/登出/聊天事件写入
+ *   /var/log/chat-logs/server/server.log
+ * 业务处理函数（注册/登录/聊天/登出）仍保持单线程同步执行；
+ * 多线程化、共享内存、线程池等留到后续阶段。
  */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +21,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "chat_common.h"
@@ -40,26 +44,75 @@ static int        user_count = 0;
 static int        read_fds[FIFO_COUNT] = {-1, -1, -1, -1};
 static int        hold_fds[FIFO_COUNT] = {-1, -1, -1, -1};
 static const char *fifo_paths[FIFO_COUNT];
+static int        g_log_fd = -1;   /* server.log 的写句柄，守护化后唯一可靠的输出 */
+
+/*
+ * 统一日志：守护化后 stdout/stderr 已重定向到 /dev/null，printf/perror 会被丢弃，
+ * 因此所有诊断都改走这里。日志句柄尚未打开时（如创建日志目录失败）退回到 stderr，
+ * 此时进程还没重定向标准流，消息仍能在终端看到。
+ * 行格式： "YYYY-MM-DD HH:MM:SS [pid=12345] [LEVEL] message"
+ */
+static void log_message(const char *level, const char *fmt, ...)
+{
+    char    ts[32];
+    char    line[1024];
+    time_t  now = time(NULL);
+    struct tm tmv;
+    va_list ap;
+    int     hdr, body;
+    size_t  len;
+    int     fd = (g_log_fd != -1) ? g_log_fd : STDERR_FILENO;
+
+    localtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+
+    hdr = snprintf(line, sizeof(line), "%s [pid=%d] [%s] ",
+                   ts, (int)getpid(), level);
+    if (hdr < 0 || (size_t)hdr >= sizeof(line)) return;
+
+    va_start(ap, fmt);
+    body = vsnprintf(line + hdr, sizeof(line) - (size_t)hdr, fmt, ap);
+    va_end(ap);
+    if (body < 0) return;
+
+    len = (size_t)hdr + (size_t)body;
+    if (len >= sizeof(line) - 1) len = sizeof(line) - 2;  /* 给换行留位 */
+    line[len++] = '\n';
+
+    {
+        size_t off = 0;
+        while (off < len)
+        {
+            ssize_t w = write(fd, line + off, len - off);
+            if (w <= 0)
+            {
+                if (w == -1 && errno == EINTR) continue;
+                break;
+            }
+            off += (size_t)w;
+        }
+    }
+}
 
 static void copy_string(char *dst, size_t dst_size, const char *src)
 {
     snprintf(dst, dst_size, "%s", src == NULL ? "" : src);
 }
 
-/* 如果目录不存在则创建；存在但非目录视为错误。 */
-static int ensure_dir(const char *path)
+/* 如果目录不存在则按 mode 创建；存在但非目录视为错误。 */
+static int ensure_dir(const char *path, mode_t mode)
 {
     struct stat st;
     if (stat(path, &st) == 0)
     {
         if (S_ISDIR(st.st_mode))
             return 0;
-        fprintf(stderr, "%s exists but is not a directory\n", path);
+        log_message("ERROR", "%s exists but is not a directory", path);
         return -1;
     }
-    if (mkdir(path, 0777) == -1)
+    if (mkdir(path, mode) == -1)
     {
-        perror(path);
+        log_message("ERROR", "mkdir %s failed: %s", path, strerror(errno));
         return -1;
     }
     return 0;
@@ -71,18 +124,39 @@ static void chown_back_to_owner(const char *path)
     struct passwd *pw = getpwnam("liwenjun2023150001");
     if (!pw) return;  /* 容器里可能没这账号，沉默跳过。 */
     if (chown(path, pw->pw_uid, pw->pw_gid) == -1 && errno != EPERM)
-        perror(path);
+        log_message("WARN", "chown %s failed: %s", path, strerror(errno));
 }
 
 /* 创建实验要求的目录树（data_dir / server_fifo / client_fifo）。 */
 static int ensure_tree(const ChatConfig *cfg)
 {
-    if (ensure_dir(cfg->data_dir) == -1) return -1;
-    if (ensure_dir(cfg->server_fifo_dir) == -1) return -1;
-    if (ensure_dir(cfg->client_fifo_dir) == -1) return -1;
+    if (ensure_dir(cfg->data_dir, 0777) == -1) return -1;
+    if (ensure_dir(cfg->server_fifo_dir, 0777) == -1) return -1;
+    if (ensure_dir(cfg->client_fifo_dir, 0777) == -1) return -1;
     chown_back_to_owner(cfg->data_dir);
     chown_back_to_owner(cfg->server_fifo_dir);
     chown_back_to_owner(cfg->client_fifo_dir);
+    return 0;
+}
+
+/*
+ * 创建日志目录树并打开 server.log。
+ * 日志根目录与文件保持 root 所有（sudo 启动时即为 root），不 chown 回普通用户，
+ * 符合"日志只允许特权进程写"的要求。日志文件权限固定 0600。
+ */
+static int open_server_log(const ChatConfig *cfg)
+{
+    if (ensure_dir(cfg->log_dir, 0700) == -1) return -1;
+    if (ensure_dir(cfg->log_dir_server, 0700) == -1) return -1;
+
+    g_log_fd = open(cfg->server_log_path,
+                    O_CREAT | O_APPEND | O_WRONLY, 0600);
+    if (g_log_fd == -1)
+    {
+        log_message("ERROR", "open %s failed: %s",
+                    cfg->server_log_path, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -94,12 +168,12 @@ static int ensure_fifo(const char *path)
     {
         if (S_ISFIFO(st.st_mode))
             return 0;
-        fprintf(stderr, "%s exists but is not a FIFO\n", path);
+        log_message("ERROR", "%s exists but is not a FIFO", path);
         return -1;
     }
     if (mkfifo(path, 0666) == -1)
     {
-        perror(path);
+        log_message("ERROR", "mkfifo %s failed: %s", path, strerror(errno));
         return -1;
     }
     return 0;
@@ -112,10 +186,18 @@ static int open_server_fifo(const char *path, int index)
     chown_back_to_owner(path);
 
     read_fds[index] = open(path, O_RDONLY | O_NONBLOCK);
-    if (read_fds[index] == -1) { perror(path); return -1; }
+    if (read_fds[index] == -1)
+    {
+        log_message("ERROR", "open(rd) %s failed: %s", path, strerror(errno));
+        return -1;
+    }
 
     hold_fds[index] = open(path, O_WRONLY | O_NONBLOCK);
-    if (hold_fds[index] == -1) { perror(path); return -1; }
+    if (hold_fds[index] == -1)
+    {
+        log_message("ERROR", "open(wr) %s failed: %s", path, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -134,7 +216,7 @@ static void cleanup(int status)
 
 static void handle_signal(int sig)
 {
-    (void)sig;
+    log_message("INFO", "received signal %d, shutting down", sig);
     cleanup(EXIT_SUCCESS);
 }
 
@@ -171,7 +253,7 @@ static void reply_to_fifo(const char *fifo, int ok, const char *message)
     ChatPacket packet;
     make_packet(&packet, CHAT_PACKET_REPLY, ok, "server", message);
     if (send_packet(fifo, &packet) == -1)
-        fprintf(stderr, "Failed to reply through %s\n", fifo);
+        log_message("WARN", "failed to reply through %s", fifo);
 }
 
 static void handle_register(const ChatAuthRequest *req)
@@ -198,7 +280,7 @@ static void handle_register(const ChatAuthRequest *req)
     users[user_count].online = 0;
     user_count++;
 
-    printf("registered user: %s\n", req->username);
+    log_message("INFO", "registered user: %s", req->username);
     reply_to_fifo(req->fifo, 1, "register ok");
 }
 
@@ -217,7 +299,7 @@ static void handle_login(const ChatAuthRequest *req)
     }
     copy_string(users[index].fifo, sizeof(users[index].fifo), req->fifo);
     users[index].online = 1;
-    printf("login user: %s, fifo: %s\n", req->username, req->fifo);
+    log_message("INFO", "login user: %s, fifo: %s", req->username, req->fifo);
     reply_to_fifo(req->fifo, 1, "login ok");
 }
 
@@ -229,7 +311,7 @@ static void handle_logout(const ChatLogoutRequest *req)
     if (strcmp(users[idx].fifo, req->fifo) != 0) return;  /* fifo 不匹配，弱身份校验失败 */
     users[idx].online = 0;
     reply_to_fifo(req->fifo, 1, "logout ok");
-    printf("logout user: %s\n", req->username);
+    log_message("INFO", "logout user: %s", req->username);
 }
 
 static void handle_chat(const ChatSendRequest *req)
@@ -255,12 +337,13 @@ static void handle_chat(const ChatSendRequest *req)
     if (send_packet(users[to_index].fifo, &packet) == -1)
     {
         users[to_index].online = 0;
+        log_message("WARN", "target fifo unavailable for %s, marked offline", req->to);
         reply_to_fifo(users[from_index].fifo, 0, "target fifo is not available");
         return;
     }
     snprintf(message, sizeof(message), "message sent to %s", req->to);
     reply_to_fifo(users[from_index].fifo, 1, message);
-    printf("%s -> %s: %s\n", req->from, req->to, req->text);
+    log_message("INFO", "%s -> %s: %s", req->from, req->to, req->text);
 }
 
 static void drain_auth_fifo(int fd, int is_register)
@@ -274,12 +357,13 @@ static void drain_auth_fifo(int fd, int is_register)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             if (errno == EINTR) continue;
-            perror("read"); return;
+            log_message("ERROR", "read auth fifo failed: %s", strerror(errno));
+            return;
         }
         if (nread == 0) return;
         if (nread != (ssize_t)sizeof(req))
         {
-            fprintf(stderr, "Ignoring incomplete auth request: %zd bytes\n", nread);
+            log_message("WARN", "ignoring incomplete auth request: %zd bytes", nread);
             continue;
         }
         if (is_register) handle_register(&req); else handle_login(&req);
@@ -297,12 +381,13 @@ static void drain_chat_fifo(int fd)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             if (errno == EINTR) continue;
-            perror("read"); return;
+            log_message("ERROR", "read chat fifo failed: %s", strerror(errno));
+            return;
         }
         if (nread == 0) return;
         if (nread != (ssize_t)sizeof(req))
         {
-            fprintf(stderr, "Ignoring incomplete chat request: %zd bytes\n", nread);
+            log_message("WARN", "ignoring incomplete chat request: %zd bytes", nread);
             continue;
         }
         handle_chat(&req);
@@ -320,36 +405,74 @@ static void drain_logout_fifo(int fd)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             if (errno == EINTR) continue;
-            perror("read"); return;
+            log_message("ERROR", "read logout fifo failed: %s", strerror(errno));
+            return;
         }
         if (nread == 0) return;
         if (nread != (ssize_t)sizeof(req))
         {
-            fprintf(stderr, "Ignoring incomplete logout request: %zd bytes\n", nread);
+            log_message("WARN", "ignoring incomplete logout request: %zd bytes", nread);
             continue;
         }
         handle_logout(&req);
     }
 }
 
-static void print_startup_banner(const ChatConfig *cfg)
+/* 把启动横幅（生效配置、FIFO 路径、协议结构体尺寸）写进 server.log。 */
+static void log_startup_info(const ChatConfig *cfg)
 {
-    printf("[%s] config loaded from %s\n", cfg->full_name, "config/chatserver.conf");
-    printf("  data_dir        = %s\n", cfg->data_dir);
-    printf("  log_dir         = %s   (本阶段尚未启用)\n", cfg->log_dir);
-    printf("  server_fifo_dir = %s\n", cfg->server_fifo_dir);
-    printf("  client_fifo_dir = %s\n", cfg->client_fifo_dir);
-    printf("[%s] sizeof(ChatPacket)        = %zu\n", cfg->full_name, sizeof(ChatPacket));
-    printf("[%s] sizeof(ChatAuthRequest)   = %zu\n", cfg->full_name, sizeof(ChatAuthRequest));
-    printf("[%s] sizeof(ChatSendRequest)   = %zu\n", cfg->full_name, sizeof(ChatSendRequest));
-    printf("[%s] sizeof(ChatLogoutRequest) = %zu\n", cfg->full_name, sizeof(ChatLogoutRequest));
-    printf("[%s] listening on:\n", cfg->full_name);
-    printf("  REG_FIFO    -> %s\n", cfg->fifo_register);
-    printf("  LOGIN_FIFO  -> %s\n", cfg->fifo_login);
-    printf("  MSG_FIFO    -> %s\n", cfg->fifo_message);
-    printf("  LOGOUT_FIFO -> %s\n", cfg->fifo_logout);
-    printf("[%s] ready (single-threaded select)\n", cfg->full_name);
-    fflush(stdout);
+    log_message("INFO", "config loaded: %s", cfg->full_name);
+    log_message("INFO", "data_dir        = %s", cfg->data_dir);
+    log_message("INFO", "log_dir         = %s", cfg->log_dir);
+    log_message("INFO", "server_fifo_dir = %s", cfg->server_fifo_dir);
+    log_message("INFO", "client_fifo_dir = %s", cfg->client_fifo_dir);
+    log_message("INFO", "sizeof(ChatPacket)        = %zu", sizeof(ChatPacket));
+    log_message("INFO", "sizeof(ChatAuthRequest)   = %zu", sizeof(ChatAuthRequest));
+    log_message("INFO", "sizeof(ChatSendRequest)   = %zu", sizeof(ChatSendRequest));
+    log_message("INFO", "sizeof(ChatLogoutRequest) = %zu", sizeof(ChatLogoutRequest));
+    log_message("INFO", "REG_FIFO    -> %s", cfg->fifo_register);
+    log_message("INFO", "LOGIN_FIFO  -> %s", cfg->fifo_login);
+    log_message("INFO", "MSG_FIFO    -> %s", cfg->fifo_message);
+    log_message("INFO", "LOGOUT_FIFO -> %s", cfg->fifo_logout);
+}
+
+/* 守护化的最后一步：把 stdin/stdout/stderr 接到 /dev/null。 */
+static void redirect_std_to_devnull(void)
+{
+    int fd = open("/dev/null", O_RDWR);
+    if (fd == -1) return;
+    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) close(fd);
+}
+
+/*
+ * 经典守护进程化（5 步法）：
+ *   1) fork，父进程退出 —— 子进程脱离调用者的进程组，不再是组长，setsid 才能成功；
+ *   2) setsid，自立新会话与新进程组，脱离控制终端；
+ *   3) 设置信号处置（在 main 里完成）；
+ *   4) chdir("/")，不再占用启动目录所在文件系统；
+ *   5) 重定向标准流到 /dev/null（在打开日志之后执行）。
+ * umask(0) 同时是 mkfifo 0666 所必需，放在 main 里 fork 之后。
+ */
+static int daemonize_step1_fork(void)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        log_message("ERROR", "fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0)
+        _exit(EXIT_SUCCESS);   /* 父进程立即退出，shell 立刻拿回提示符 */
+
+    if (setsid() == -1)
+    {
+        log_message("ERROR", "setsid failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -363,17 +486,42 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* 先于守护化加载配置：相对路径（如 config/chatserver.conf）只有在
+     * chdir("/") 之前、还在调用者工作目录里时才解析得到。 */
     if (chat_config_load(argv[1], &g_cfg) != 0)
         return EXIT_FAILURE;
 
+    /* 守护化第 1、2 步：fork + setsid。 */
+    if (daemonize_step1_fork() != 0)
+        return EXIT_FAILURE;
+
+    /* 守护化第 3 步：信号处置。
+     * SIGINT/SIGTERM 记录并清理后退出；SIGHUP 忽略（无控制终端，仅防意外）；
+     * SIGPIPE 忽略，避免向已关闭的客户端 FIFO 写时进程被杀。 */
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
-    signal(SIGHUP, handle_signal);
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
-    /* mkfifo 之前必须 umask(0)，否则 0666 会被默认 umask 022 砍成 0644。 */
+    /* 守护化第 4 步：切到根目录。 */
+    if (chdir("/") == -1)
+        return EXIT_FAILURE;
+
+    /* mkfifo / mkdir 之前必须 umask(0)，否则 0666/0700 会被默认 umask 砍掉。 */
     umask(0);
 
-    if (ensure_tree(&g_cfg) == -1) exit(EXIT_FAILURE);
+    /* 打开日志（绝对路径，不受 chdir("/") 影响）。此前 g_log_fd==-1，
+     * log_message 会退回 stderr——但此刻标准流尚未重定向，仍可见。 */
+    if (open_server_log(&g_cfg) != 0)
+        return EXIT_FAILURE;
+
+    /* 守护化第 5 步：日志就绪后再把标准流接到 /dev/null。 */
+    redirect_std_to_devnull();
+
+    log_message("INFO", "server starting");
+    log_startup_info(&g_cfg);
+
+    if (ensure_tree(&g_cfg) == -1) cleanup(EXIT_FAILURE);
 
     fifo_paths[FIFO_REGISTER] = g_cfg.fifo_register;
     fifo_paths[FIFO_LOGIN]    = g_cfg.fifo_login;
@@ -383,7 +531,7 @@ int main(int argc, char *argv[])
     for (i = 0; i < FIFO_COUNT; i++)
         if (open_server_fifo(fifo_paths[i], i) == -1) cleanup(EXIT_FAILURE);
 
-    print_startup_banner(&g_cfg);
+    log_message("INFO", "%s ready (single-threaded select)", g_cfg.full_name);
 
     while (1)
     {
@@ -398,7 +546,7 @@ int main(int argc, char *argv[])
         if (select(maxfd + 1, &rfds, NULL, NULL, NULL) == -1)
         {
             if (errno == EINTR) continue;
-            perror("select");
+            log_message("ERROR", "select failed: %s", strerror(errno));
             cleanup(EXIT_FAILURE);
         }
 
