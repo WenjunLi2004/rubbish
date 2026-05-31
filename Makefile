@@ -3,15 +3,24 @@ VERSION    := $(shell awk -F= '/^[[:space:]]*version/{gsub(/[ \t]/,""); print $$
 SERVER_BIN := bin/chatserver_$(SHORT_NAME)_$(VERSION)
 CLIENT_BIN := bin/chatclient
 
+UNAME_S := $(shell uname -s)
+
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -std=gnu11 -Isrc -I.
 LDFLAGS :=
 
+# 服务器自阶段 03 起使用共享内存 + 进程间互斥锁，需要 pthread。
+# Linux 上 shm_open 在较老 glibc 里位于 librt，故链接 -lrt（新 glibc 无害）。
+SERVER_LDLIBS := -pthread
+ifeq ($(UNAME_S),Linux)
+SERVER_LDLIBS += -lrt
+endif
+
 all: $(SERVER_BIN) $(CLIENT_BIN)
 
-$(SERVER_BIN): chatserver.c src/config.c
+$(SERVER_BIN): chatserver.c src/config.c src/user_store.c
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(SERVER_LDLIBS)
 
 $(CLIENT_BIN): chatclient.c src/config.c
 	@mkdir -p bin
@@ -20,8 +29,8 @@ $(CLIENT_BIN): chatclient.c src/config.c
 clean:
 	rm -rf bin
 
-# `make smoke` 默认跑当前阶段（02）的冒烟。保留 smoke-stage01 便于回归对比。
-smoke: smoke-stage02
+# `make smoke` 默认跑当前阶段（03）的冒烟。保留 smoke-stage01/02 便于回归对比。
+smoke: smoke-stage03
 
 smoke-stage01: all
 	scripts/smoke/smoke-stage01.sh
@@ -29,4 +38,7 @@ smoke-stage01: all
 smoke-stage02: all
 	scripts/smoke/smoke-stage02.sh
 
-.PHONY: all clean smoke smoke-stage01 smoke-stage02
+smoke-stage03: all
+	scripts/smoke/smoke-stage03.sh
+
+.PHONY: all clean smoke smoke-stage01 smoke-stage02 smoke-stage03

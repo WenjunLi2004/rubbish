@@ -1,12 +1,12 @@
 /*
  * chatserver.c
  *
- * 多用户聊天系统服务器（阶段 02）。
- * 在阶段 01 的基础上把服务器守护进程化（daemon），并把启动、退出、
- * 致命错误以及注册/登录/登出/聊天事件写入
- *   /var/log/chat-logs/server/server.log
- * 业务处理函数（注册/登录/聊天/登出）仍保持单线程同步执行；
- * 多线程化、共享内存、线程池等留到后续阶段。
+ * 多用户聊天系统服务器（阶段 03）。
+ * 在阶段 02（守护进程化 + server.log）的基础上，把用户表从进程内的普通
+ * 全局数组迁移到 POSIX 共享内存对象，并用放在共享区内、属性为
+ * PTHREAD_PROCESS_SHARED 的 pthread 互斥锁保护（实现见 src/user_store.[ch]）。
+ * 服务器本阶段仍是单进程单线程 select 主循环；加锁是为阶段 04 的工作线程
+ * 预留正确性，多线程分派/线程池等留到后续阶段。
  */
 
 #include <errno.h>
@@ -26,21 +26,13 @@
 
 #include "chat_common.h"
 #include "src/config.h"
-
-typedef struct
-{
-    char username[CHAT_NAME_LEN];
-    char password[CHAT_PASSWORD_LEN];
-    char fifo[CHAT_FIFO_PATH_LEN];
-    int online;
-} User;
+#include "src/user_store.h"
 
 /* 4 路公共 FIFO 的统一索引。 */
 enum { FIFO_REGISTER = 0, FIFO_LOGIN, FIFO_MESSAGE, FIFO_LOGOUT, FIFO_COUNT };
 
-static ChatConfig g_cfg;
-static User       users[CHAT_MAX_USERS];
-static int        user_count = 0;
+static ChatConfig      g_cfg;
+static UserStoreHandle g_store;    /* 共享内存用户表句柄，取代旧的全局数组 */
 static int        read_fds[FIFO_COUNT] = {-1, -1, -1, -1};
 static int        hold_fds[FIFO_COUNT] = {-1, -1, -1, -1};
 static const char *fifo_paths[FIFO_COUNT];
@@ -215,7 +207,7 @@ static int open_server_fifo(const char *path, int index)
     return 0;
 }
 
-/* 关闭所有 FIFO，并删除服务器创建的 4 个公共 FIFO。 */
+/* 关闭所有 FIFO、删除 4 个公共 FIFO，并解除映射/删除共享内存对象。 */
 static void cleanup(int status)
 {
     int i;
@@ -225,6 +217,8 @@ static void cleanup(int status)
         if (hold_fds[i] != -1) close(hold_fds[i]);
         if (fifo_paths[i]) unlink(fifo_paths[i]);
     }
+    /* 对零值/未初始化句柄安全；正常关闭时 munmap + shm_unlink。 */
+    user_store_destroy(&g_store);
     exit(status);
 }
 
@@ -246,14 +240,6 @@ static void shutdown_if_requested(void)
     log_message("INFO", "received signal %d, shutting down",
                 (int)g_shutdown_signal);
     cleanup(EXIT_SUCCESS);
-}
-
-static int find_user(const char *username)
-{
-    int i;
-    for (i = 0; i < user_count; i++)
-        if (strcmp(users[i].username, username) == 0) return i;
-    return -1;
 }
 
 static int send_packet(const char *fifo, const ChatPacket *packet)
@@ -286,91 +272,104 @@ static void reply_to_fifo(const char *fifo, int ok, const char *message)
 
 static void handle_register(const ChatAuthRequest *req)
 {
+    UserStoreStatus st;
+
     if (req->username[0] == '\0' || req->password[0] == '\0')
     {
         reply_to_fifo(req->fifo, 0, "username and password must not be empty");
         return;
     }
-    if (find_user(req->username) != -1)
+
+    st = user_store_register(&g_store, req->username, req->password, req->fifo);
+    switch (st)
     {
+    case USER_STORE_OK:
+        log_message("INFO", "registered user: %s", req->username);
+        reply_to_fifo(req->fifo, 1, "register ok");
+        break;
+    case USER_STORE_ERR_EXISTS:
+        log_message("WARN", "duplicate register rejected: %s", req->username);
         reply_to_fifo(req->fifo, 0, "username already exists");
-        return;
-    }
-    if (user_count >= CHAT_MAX_USERS)
-    {
+        break;
+    case USER_STORE_ERR_FULL:
         reply_to_fifo(req->fifo, 0, "server user table is full");
-        return;
+        break;
+    default:
+        reply_to_fifo(req->fifo, 0, "register failed");
+        break;
     }
-
-    copy_string(users[user_count].username, sizeof(users[user_count].username), req->username);
-    copy_string(users[user_count].password, sizeof(users[user_count].password), req->password);
-    copy_string(users[user_count].fifo, sizeof(users[user_count].fifo), req->fifo);
-    users[user_count].online = 0;
-    user_count++;
-
-    log_message("INFO", "registered user: %s", req->username);
-    reply_to_fifo(req->fifo, 1, "register ok");
 }
 
 static void handle_login(const ChatAuthRequest *req)
 {
-    int index = find_user(req->username);
-    if (index == -1)
+    UserStoreStatus st = user_store_login(&g_store, req->username,
+                                          req->password, req->fifo);
+    switch (st)
     {
+    case USER_STORE_OK:
+        log_message("INFO", "login user: %s, fifo: %s", req->username, req->fifo);
+        reply_to_fifo(req->fifo, 1, "login ok");
+        break;
+    case USER_STORE_ERR_NOT_FOUND:
         reply_to_fifo(req->fifo, 0, "username does not exist");
-        return;
-    }
-    if (strcmp(users[index].password, req->password) != 0)
-    {
+        break;
+    case USER_STORE_ERR_BAD_PASSWORD:
         reply_to_fifo(req->fifo, 0, "password is incorrect");
-        return;
+        break;
+    default:
+        reply_to_fifo(req->fifo, 0, "login failed");
+        break;
     }
-    copy_string(users[index].fifo, sizeof(users[index].fifo), req->fifo);
-    users[index].online = 1;
-    log_message("INFO", "login user: %s, fifo: %s", req->username, req->fifo);
-    reply_to_fifo(req->fifo, 1, "login ok");
 }
 
-/* 阶段 01 的登出 stub：核心是身份校验 + 置 online=0；不广播 ONLINE_LIST。 */
+/* 登出：身份校验（username + fifo 弱校验）+ 置 online=0；本阶段不广播 ONLINE_LIST。
+ * 用户不存在或 fifo 不匹配时静默丢弃，与阶段 01/02 行为一致。 */
 static void handle_logout(const ChatLogoutRequest *req)
 {
-    int idx = find_user(req->username);
-    if (idx == -1) return;                                /* 不存在的用户，沉默丢弃 */
-    if (strcmp(users[idx].fifo, req->fifo) != 0) return;  /* fifo 不匹配，弱身份校验失败 */
-    users[idx].online = 0;
+    UserStoreStatus st = user_store_logout(&g_store, req->username, req->fifo);
+    if (st != USER_STORE_OK) return;   /* NOT_FOUND / FIFO_MISMATCH：沉默丢弃 */
     reply_to_fifo(req->fifo, 1, "logout ok");
     log_message("INFO", "logout user: %s", req->username);
 }
 
 static void handle_chat(const ChatSendRequest *req)
 {
-    int from_index = find_user(req->from);
-    int to_index = find_user(req->to);
+    char       from_fifo[CHAT_FIFO_PATH_LEN];
+    char       to_fifo[CHAT_FIFO_PATH_LEN];
     ChatPacket packet;
-    char message[CHAT_TEXT_LEN];
+    char       message[CHAT_TEXT_LEN];
+    ChatPrepStatus prep;
 
-    if (from_index == -1 || !users[from_index].online) return;
-    if (to_index == -1)
+    /* 一次加锁内取一致快照：发送方在线、目标存在且在线，复制双方 fifo。 */
+    prep = user_store_prepare_chat(&g_store, req->from, req->to,
+                                   from_fifo, sizeof(from_fifo),
+                                   to_fifo, sizeof(to_fifo));
+    switch (prep)
     {
-        reply_to_fifo(users[from_index].fifo, 0, "target user does not exist");
+    case CHAT_PREP_SENDER_INVALID:
+        return;   /* 发送方不存在/不在线：静默丢弃 */
+    case CHAT_PREP_TARGET_MISSING:
+        reply_to_fifo(from_fifo, 0, "target user does not exist");
         return;
-    }
-    if (!users[to_index].online)
-    {
-        reply_to_fifo(users[from_index].fifo, 0, "target user is not online");
+    case CHAT_PREP_TARGET_OFFLINE:
+        reply_to_fifo(from_fifo, 0, "target user is not online");
         return;
+    case CHAT_PREP_OK:
+        break;
     }
 
+    /* FIFO 写在锁外进行。 */
     make_packet(&packet, CHAT_PACKET_MESSAGE, 1, req->from, req->text);
-    if (send_packet(users[to_index].fifo, &packet) == -1)
+    if (send_packet(to_fifo, &packet) == -1)
     {
-        users[to_index].online = 0;
-        log_message("WARN", "target fifo unavailable for %s, marked offline", req->to);
-        reply_to_fifo(users[from_index].fifo, 0, "target fifo is not available");
+        /* 投递失败：仅当目标记录仍指向同一 fifo 时才置离线，避免误伤期间重新登录者。 */
+        if (user_store_mark_offline_if_fifo(&g_store, req->to, to_fifo))
+            log_message("WARN", "target fifo unavailable for %s, marked offline", req->to);
+        reply_to_fifo(from_fifo, 0, "target fifo is not available");
         return;
     }
     snprintf(message, sizeof(message), "message sent to %s", req->to);
-    reply_to_fifo(users[from_index].fifo, 1, message);
+    reply_to_fifo(from_fifo, 1, message);
     log_message("INFO", "%s -> %s: %s", req->from, req->to, req->text);
 }
 
@@ -548,6 +547,20 @@ int main(int argc, char *argv[])
 
     log_message("INFO", "server starting");
     log_startup_info(&g_cfg);
+
+    /* 在处理任何请求前初始化共享内存用户表（取代旧的全局数组）。 */
+    if (user_store_init(&g_store, g_cfg.short_name) != 0)
+    {
+        log_message("ERROR", "user store init failed: %s", strerror(errno));
+        cleanup(EXIT_FAILURE);
+    }
+    log_message("INFO", "shm user store ready: name=%s shm_size=%zu sizeof(ChatUserStore)=%zu",
+                g_store.name, g_store.size, sizeof(ChatUserStore));
+    if (g_store.process_shared)
+        log_message("INFO", "user store mutex initialized as process-shared");
+    else
+        log_message("WARN", "user store mutex is NOT process-shared "
+                            "(PTHREAD_PROCESS_SHARED unsupported on this OS)");
 
     if (ensure_tree(&g_cfg) == -1) cleanup(EXIT_FAILURE);
 

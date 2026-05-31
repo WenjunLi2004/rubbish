@@ -14,3 +14,4 @@ scripts/smoke/.server.log
 # 编辑器
 .vscode/
 *.swp
+.DS_Store
