@@ -1,7 +1,7 @@
 /*
  * config.c
  *
- * 解析 `key = value` 风格的配置文件，并填充 ChatConfig 的派生字段。
+ * 解析 `key = value` 风格的配置文件，并填充 ChatConfig 的派生字段（2026 试题对齐版）。
  * 调用者保证 out 非空；本函数失败时不保证 out 中字段状态可用。
  */
 
@@ -49,11 +49,10 @@ int chat_config_load(const char *path, ChatConfig *out) {
     char  line[1024];
     int   lineno = 0;
     int   have_server = 0, have_short = 0, have_version = 0;
-    int   have_data = 0, have_log = 0, have_prefix = 0;
-    int   have_pool = 0;
+    int   have_fifo = 0, have_client = 0, have_log = 0, have_prefix = 0;
 
     memset(out, 0, sizeof(*out));
-    out->poolsize = 10;  /* 缺省值；后续校验仍要求 >0 */
+    out->poolsize = 100;  /* 缺省值（试题=100）；后续校验仍要求 >0 */
 
     fp = fopen(path, "r");
     if (!fp) {
@@ -89,9 +88,12 @@ int chat_config_load(const char *path, ChatConfig *out) {
         } else if (strcmp(key, "version") == 0) {
             if (copy_field(out->version, sizeof(out->version), val, key) < 0) goto fail;
             have_version = 1;
-        } else if (strcmp(key, "data_dir") == 0) {
-            if (copy_field(out->data_dir, sizeof(out->data_dir), val, key) < 0) goto fail;
-            have_data = 1;
+        } else if (strcmp(key, "fifo_dir") == 0) {
+            if (copy_field(out->fifo_dir, sizeof(out->fifo_dir), val, key) < 0) goto fail;
+            have_fifo = 1;
+        } else if (strcmp(key, "client_fifo_dir") == 0) {
+            if (copy_field(out->client_fifo_dir, sizeof(out->client_fifo_dir), val, key) < 0) goto fail;
+            have_client = 1;
         } else if (strcmp(key, "log_dir") == 0) {
             if (copy_field(out->log_dir, sizeof(out->log_dir), val, key) < 0) goto fail;
             have_log = 1;
@@ -106,7 +108,6 @@ int chat_config_load(const char *path, ChatConfig *out) {
                 goto fail;
             }
             out->poolsize = (int)v;
-            have_pool = 1;
         } else {
             fprintf(stderr, "config: warning: unknown key '%s' at line %d\n", key, lineno);
         }
@@ -116,55 +117,50 @@ int chat_config_load(const char *path, ChatConfig *out) {
     fp = NULL;
 
     if (!have_server || !have_short || !have_version ||
-        !have_data || !have_log || !have_prefix) {
+        !have_fifo || !have_client || !have_log || !have_prefix) {
         fprintf(stderr, "config: missing required keys (server_name/short_name/version/"
-                        "data_dir/log_dir/fifo_prefix)\n");
+                        "fifo_dir/client_fifo_dir/log_dir/fifo_prefix)\n");
         return -1;
     }
-    (void)have_pool;  /* poolsize 缺省 10，可选 */
 
-    /* 派生字段拼装。 */
-    if (join_path(out->full_name, sizeof(out->full_name), "full_name",
-                  "%s_%s", out->server_name, out->short_name) < 0) return -1;
+    /* full_name = server_name_short_name_version, 例如 chatserver_lwj_1.0 */
     {
-        /* full_name 还要再追加 _version；前一步只拼了 server_short，再补一次。 */
-        char tmp[96];
-        int  n = snprintf(tmp, sizeof(tmp), "%s_%s", out->full_name, out->version);
-        if (n < 0 || (size_t)n >= sizeof(tmp)) {
+        int n = snprintf(out->full_name, sizeof(out->full_name), "%s_%s_%s",
+                         out->server_name, out->short_name, out->version);
+        if (n < 0 || (size_t)n >= sizeof(out->full_name)) {
             fprintf(stderr, "config: derived 'full_name' too long\n");
             return -1;
         }
-        memcpy(out->full_name, tmp, (size_t)n + 1);
     }
 
-    if (join_path(out->server_fifo_dir, sizeof(out->server_fifo_dir), "server_fifo_dir",
-                  "%s/%s", out->data_dir, "server_fifo") < 0) return -1;
-    if (join_path(out->client_fifo_dir, sizeof(out->client_fifo_dir), "client_fifo_dir",
-                  "%s/%s", out->data_dir, "client_fifo") < 0) return -1;
+    /* server_fifo_dir 即公共 FIFO 目录本身（不再有 <data>/server_fifo 这一层）。 */
+    if (copy_field(out->server_fifo_dir, sizeof(out->server_fifo_dir), out->fifo_dir,
+                   "server_fifo_dir") < 0) return -1;
 
+    /* 4 个公共 FIFO：<fifo_dir>/<prefix>_{reg,login,msg,logout}_fifo */
     {
         char fname[64];
         int  n;
 
-        n = snprintf(fname, sizeof(fname), "%sregister", out->fifo_prefix);
+        n = snprintf(fname, sizeof(fname), "%s_reg_fifo", out->fifo_prefix);
         if (n < 0 || (size_t)n >= sizeof(fname)) goto fname_too_long;
         if (join_path(out->fifo_register, sizeof(out->fifo_register), "fifo_register",
-                      "%s/%s", out->server_fifo_dir, fname) < 0) return -1;
+                      "%s/%s", out->fifo_dir, fname) < 0) return -1;
 
-        n = snprintf(fname, sizeof(fname), "%slogin", out->fifo_prefix);
+        n = snprintf(fname, sizeof(fname), "%s_login_fifo", out->fifo_prefix);
         if (n < 0 || (size_t)n >= sizeof(fname)) goto fname_too_long;
         if (join_path(out->fifo_login, sizeof(out->fifo_login), "fifo_login",
-                      "%s/%s", out->server_fifo_dir, fname) < 0) return -1;
+                      "%s/%s", out->fifo_dir, fname) < 0) return -1;
 
-        n = snprintf(fname, sizeof(fname), "%ssendmsg", out->fifo_prefix);
+        n = snprintf(fname, sizeof(fname), "%s_msg_fifo", out->fifo_prefix);
         if (n < 0 || (size_t)n >= sizeof(fname)) goto fname_too_long;
         if (join_path(out->fifo_message, sizeof(out->fifo_message), "fifo_message",
-                      "%s/%s", out->server_fifo_dir, fname) < 0) return -1;
+                      "%s/%s", out->fifo_dir, fname) < 0) return -1;
 
-        n = snprintf(fname, sizeof(fname), "%slogout", out->fifo_prefix);
+        n = snprintf(fname, sizeof(fname), "%s_logout_fifo", out->fifo_prefix);
         if (n < 0 || (size_t)n >= sizeof(fname)) goto fname_too_long;
         if (join_path(out->fifo_logout, sizeof(out->fifo_logout), "fifo_logout",
-                      "%s/%s", out->server_fifo_dir, fname) < 0) return -1;
+                      "%s/%s", out->fifo_dir, fname) < 0) return -1;
 
         if (0) {
 fname_too_long:
@@ -173,10 +169,9 @@ fname_too_long:
         }
     }
 
+    /* 日志路径。 */
     if (join_path(out->log_dir_server, sizeof(out->log_dir_server), "log_dir_server",
                   "%s/%s", out->log_dir, "server") < 0) return -1;
-    if (join_path(out->log_dir_users, sizeof(out->log_dir_users), "log_dir_users",
-                  "%s/%s", out->log_dir, "users") < 0) return -1;
     if (join_path(out->server_log_path, sizeof(out->server_log_path), "server_log_path",
                   "%s/%s", out->log_dir_server, "server.log") < 0) return -1;
     if (join_path(out->threads_log_path, sizeof(out->threads_log_path), "threads_log_path",

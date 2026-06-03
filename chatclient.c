@@ -63,7 +63,6 @@ static int ensure_dir(const char *path)
 
 static int ensure_tree(void)
 {
-    if (ensure_dir(cfg.data_dir) == -1) return -1;
     if (ensure_dir(cfg.client_fifo_dir) == -1) return -1;
     return 0;
 }

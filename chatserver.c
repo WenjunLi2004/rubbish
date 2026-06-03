@@ -124,13 +124,11 @@ static void chown_back_to_owner(const char *path)
         log_message("WARN", "chown %s failed: %s", path, strerror(errno));
 }
 
-/* 创建实验要求的目录树（data_dir / server_fifo / client_fifo）。 */
+/* 创建实验要求的目录树（2026：公共 FIFO 目录 / 客户端私有 FIFO 目录）。 */
 static int ensure_tree(const ChatConfig *cfg)
 {
-    if (ensure_dir(cfg->data_dir, 0777) == -1) return -1;
     if (ensure_dir(cfg->server_fifo_dir, 0777) == -1) return -1;
     if (ensure_dir(cfg->client_fifo_dir, 0777) == -1) return -1;
-    chown_back_to_owner(cfg->data_dir);
     chown_back_to_owner(cfg->server_fifo_dir);
     chown_back_to_owner(cfg->client_fifo_dir);
     return 0;
@@ -449,7 +447,7 @@ static void drain_logout_fifo(int fd)
 static void log_startup_info(const ChatConfig *cfg)
 {
     log_message("INFO", "config loaded: %s", cfg->full_name);
-    log_message("INFO", "data_dir        = %s", cfg->data_dir);
+    log_message("INFO", "fifo_dir        = %s", cfg->fifo_dir);
     log_message("INFO", "log_dir         = %s", cfg->log_dir);
     log_message("INFO", "server_fifo_dir = %s", cfg->server_fifo_dir);
     log_message("INFO", "client_fifo_dir = %s", cfg->client_fifo_dir);
