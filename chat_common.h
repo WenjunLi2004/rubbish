@@ -1,10 +1,12 @@
 /*
  * chat_common.h
  *
- * 多用户聊天系统的公共协议头文件。
- * 服务器和客户端都包含这个文件，保证双方使用相同的字段长度和
- * 通信结构体格式。所有路径与 FIFO 名都不再硬编码，统一由
- * `src/config.h` 的 ChatConfig 在运行时提供。
+ * 多用户聊天系统的公共线协议头文件（2026 试题对齐版）。
+ * 服务器和客户端都包含这个文件，保证双方字段长度与结构体格式一致。
+ * 这是 client <-> server 之间的“线协议”；服务器内部的共享内存用户表实现
+ * 在 src/user_store.[ch]，与本文件无关。
+ *
+ * 新增字段一律追加在结构体尾部，不重排已有字段。
  */
 
 #ifndef CHAT_COMMON_H
@@ -15,7 +17,13 @@
 #define CHAT_NAME_LEN 32
 #define CHAT_PASSWORD_LEN 32
 #define CHAT_FIFO_PATH_LEN 256
-#define CHAT_TEXT_LEN 256
+/* 正文/在线名单串长度。在线名单可能较长（多个用户名），故给到 512；
+ * sizeof(ChatPacket) 仍远小于 PIPE_BUF(4096)，保证单包 write 在 FIFO 上原子。 */
+#define CHAT_TEXT_LEN 512
+
+/* 机器人管理请求的保留目标名：客户端把 /bot add|del 当作发给 __botmgr__ 的消息。
+ * 复用 MSG_FIFO，不新增第 5 个公共 FIFO（试题只列了 4 个公共 FIFO）。 */
+#define CHAT_BOTMGR_TARGET "__botmgr__"
 
 /*
  * 注册和登录请求结构体。
@@ -29,7 +37,7 @@ typedef struct
     char fifo[CHAT_FIFO_PATH_LEN];
 } ChatAuthRequest;
 
-/* 客户端发送聊天消息时使用的请求结构体。 */
+/* 客户端发送聊天消息时使用的请求结构体；机器人管理也复用它（to=__botmgr__）。 */
 typedef struct
 {
     char from[CHAT_NAME_LEN];
@@ -49,21 +57,30 @@ typedef struct
 
 typedef enum
 {
-    CHAT_PACKET_REPLY = 1,
-    CHAT_PACKET_MESSAGE = 2
+    CHAT_PACKET_REPLY        = 1, /* 对某请求的应答 */
+    CHAT_PACKET_MESSAGE      = 2, /* 别人发来的实时消息（含机器人回复） */
+    CHAT_PACKET_ONLINE_LIST  = 3, /* 在线人数 + 名单广播 */
+    CHAT_PACKET_OFFLINE_PUSH = 4, /* 重新登录后回推的离线消息（带原始时间） */
+    CHAT_PACKET_SYSTEM       = 5  /* 系统事件：登入/登出/机器人增减广播 */
 } ChatPacketType;
 
 /*
  * 服务器向客户端发送的统一数据包。
- * timestamp/send_count/reserved 等扩展字段留到后续阶段再追加，
- * 当前阶段保持 1.0.0 协议字段不变。
+ *   - REPLY:        from="server", message=文案, online_count=登录回执时的在线数
+ *   - MESSAGE:      from=发送方（>5 次往来时尾部带 '*'）, timestamp=收到时间, send_count=累计成功次数
+ *   - ONLINE_LIST:  from="server", message="u1,u2*,u3", online_count=在线总数
+ *   - OFFLINE_PUSH: from=原始发送方, message=原始正文, timestamp=原始发送时间
+ *   - SYSTEM:       from="server", message=事件文案
  */
 typedef struct
 {
-    int type;
-    int ok;
-    char from[CHAT_NAME_LEN];
-    char message[CHAT_TEXT_LEN];
+    int  type;                    /* ChatPacketType */
+    int  ok;                      /* REPLY: 1=成功 0=失败；其他类型固定 1 */
+    char from[CHAT_NAME_LEN];     /* 来源；服务器回包用 "server" */
+    char message[CHAT_TEXT_LEN];  /* 文本载荷 / 在线名单 */
+    long timestamp;               /* 服务器侧 time(NULL)；OFFLINE_PUSH 为原始发送时间 */
+    int  send_count;              /* from->to 的累计成功次数（含本次） */
+    int  online_count;            /* 在线总数（ONLINE_LIST / 登录回执） */
 } ChatPacket;
 
 #endif

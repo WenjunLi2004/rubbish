@@ -1,10 +1,10 @@
 /*
  * chatclient.c
  *
- * 多用户聊天系统客户端（阶段 01）。
+ * 多用户聊天系统客户端（2026 试题对齐版）。
  * 启动签名：chatclient <conf> <username> <password>
- * 所有 FIFO 路径来自配置文件，不再硬编码。
- * 新增 /logout：会话级登出，进程不退出；/quit 才退进程。
+ * 命令：/register /login /logout /send <user> <text> /bot add|del <x> /quit
+ * 显示：REPLY / MESSAGE / ONLINE_LIST / OFFLINE_PUSH / SYSTEM。
  */
 
 #include <ctype.h>
@@ -17,6 +17,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "chat_common.h"
@@ -34,6 +35,14 @@ static void copy_string(char *dst, size_t dst_size, const char *src)
     snprintf(dst, dst_size, "%s", src == NULL ? "" : src);
 }
 
+static void fmt_time(long t, char *buf, size_t sz)
+{
+    time_t tt = (time_t)t;
+    struct tm tmv;
+    localtime_r(&tt, &tmv);
+    strftime(buf, sz, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
 static void cleanup(int status)
 {
     if (fifo_fd != -1) close(fifo_fd);
@@ -48,22 +57,21 @@ static void handle_signal(int sig)
     cleanup(EXIT_SUCCESS);
 }
 
-static int ensure_dir(const char *path)
+/* mkdir -p：逐级创建。 */
+static int mkdir_p(const char *path, mode_t mode)
 {
-    struct stat st;
-    if (stat(path, &st) == 0)
+    char tmp[512];
+    size_t len = strlen(path), i;
+    if (len == 0 || len >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(tmp, path, len + 1);
+    for (i = 1; i < len; i++)
     {
-        if (S_ISDIR(st.st_mode)) return 0;
-        fprintf(stderr, "%s exists but is not a directory\n", path);
-        return -1;
+        if (tmp[i] != '/') continue;
+        tmp[i] = '\0';
+        if (mkdir(tmp, mode) == -1 && errno != EEXIST) return -1;
+        tmp[i] = '/';
     }
-    if (mkdir(path, 0777) == -1) { perror(path); return -1; }
-    return 0;
-}
-
-static int ensure_tree(void)
-{
-    if (ensure_dir(cfg.client_fifo_dir) == -1) return -1;
+    if (mkdir(tmp, mode) == -1 && errno != EEXIST) return -1;
     return 0;
 }
 
@@ -81,8 +89,10 @@ static int valid_username(const char *name)
 static int prepare_client_fifo(void)
 {
     struct stat st;
-    snprintf(myfifo, sizeof(myfifo), "%s/%s", cfg.client_fifo_dir, username);
 
+    if (mkdir_p(cfg.client_fifo_dir, 0777) == -1) { perror(cfg.client_fifo_dir); return -1; }
+
+    snprintf(myfifo, sizeof(myfifo), "%s/%s", cfg.client_fifo_dir, username);
     if (stat(myfifo, &st) == 0)
     {
         if (!S_ISFIFO(st.st_mode))
@@ -146,7 +156,9 @@ static void print_help(void)
     printf("  /register             register current username and password\n");
     printf("  /login                login current username and password\n");
     printf("  /logout               logout current session (process keeps running)\n");
-    printf("  /send <user> <text>   send text to another online user\n");
+    printf("  /send <user> <text>   send text to another online user (or bot)\n");
+    printf("  /bot add <x>          ask server to add x chat robots\n");
+    printf("  /bot del <x>          ask server to remove x online chat robots\n");
     printf("  /quit                 exit client\n");
 }
 
@@ -156,19 +168,31 @@ static void print_prompt(void)
     fflush(stdout);
 }
 
-static void print_packet(const ChatPacket *packet)
+static void print_packet(const ChatPacket *p)
 {
-    if (packet->type == CHAT_PACKET_MESSAGE)
+    char tbuf[32];
+    switch (p->type)
     {
-        printf("\n[%s] %s\n", packet->from, packet->message);
-        return;
+    case CHAT_PACKET_MESSAGE:
+        printf("\n[%s] %s\n", p->from, p->message);
+        break;
+    case CHAT_PACKET_ONLINE_LIST:
+        printf("\n[online %d] %s\n", p->online_count, p->message);
+        break;
+    case CHAT_PACKET_OFFLINE_PUSH:
+        fmt_time(p->timestamp, tbuf, sizeof(tbuf));
+        printf("\n[offline from %s @ %s] %s\n", p->from, tbuf, p->message);
+        break;
+    case CHAT_PACKET_SYSTEM:
+        printf("\n[system] %s\n", p->message);
+        break;
+    case CHAT_PACKET_REPLY:
+        printf("\n[server] %s: %s\n", p->ok ? "OK" : "ERROR", p->message);
+        break;
+    default:
+        printf("\n[server] unknown packet type %d\n", p->type);
+        break;
     }
-    if (packet->type == CHAT_PACKET_REPLY)
-    {
-        printf("\n[server] %s: %s\n", packet->ok ? "OK" : "ERROR", packet->message);
-        return;
-    }
-    printf("\n[server] unknown packet type %d\n", packet->type);
 }
 
 static void drain_packets(void)
@@ -190,6 +214,22 @@ static void drain_packets(void)
     }
 }
 
+/* 解析 "/bot add 2" / "/bot del 1"，转成发给 __botmgr__ 的消息。 */
+static void handle_bot_command(const char *args)
+{
+    char op[8] = {0};
+    int  x = -1;
+    char text[CHAT_TEXT_LEN];
+    if (sscanf(args, "%7s %d", op, &x) != 2 ||
+        (strcmp(op, "add") != 0 && strcmp(op, "del") != 0) || x < 0)
+    {
+        printf("Usage: /bot add <x> | /bot del <x>\n");
+        return;
+    }
+    snprintf(text, sizeof(text), "%s %d", op, x);
+    send_chat_request(CHAT_BOTMGR_TARGET, text);
+}
+
 static int handle_line(char *line)
 {
     char *p, *to, *text;
@@ -201,6 +241,8 @@ static int handle_line(char *line)
     if (strcmp(line, "/login") == 0)    { send_auth_request(cfg.fifo_login);    return 0; }
     if (strcmp(line, "/logout") == 0)   { send_logout_request();                return 0; }
     if (strcmp(line, "/quit") == 0) return 1;
+
+    if (strncmp(line, "/bot ", 5) == 0) { handle_bot_command(line + 5); return 0; }
 
     if (strncmp(line, "/send ", 6) == 0)
     {
@@ -228,7 +270,7 @@ static int handle_line(char *line)
 int main(int argc, char *argv[])
 {
     fd_set rfds;
-    char   line[512];
+    char   line[CHAT_TEXT_LEN + 64];
     int    maxfd;
 
     if (argc != 4)
@@ -253,7 +295,7 @@ int main(int argc, char *argv[])
     signal(SIGTERM, handle_signal);
     signal(SIGHUP, handle_signal);
 
-    if (ensure_tree() == -1 || prepare_client_fifo() == -1)
+    if (prepare_client_fifo() == -1)
         cleanup(EXIT_FAILURE);
 
     printf("client fifo: %s\n", myfifo);
