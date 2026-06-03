@@ -1,15 +1,15 @@
 /*
  * user_store.h
  *
- * 阶段 03：把服务器的用户表从 chatserver.c 的普通全局数组迁到
- * POSIX 共享内存对象，并用放在共享内存区内、属性为
- * PTHREAD_PROCESS_SHARED 的 pthread 互斥锁保护。
+ * 服务器内部的共享内存用户表（2026 试题对齐版）。
+ * 用户表放在 POSIX 共享内存对象里，由放在共享区内、属性为
+ * PTHREAD_PROCESS_SHARED 的 pthread 互斥锁保护。本阶段服务器是
+ * 多线程（线程池）单进程，工作线程并发访问这张表，全部走这把锁。
  *
- * 本头文件只描述“服务器内部的用户表存储”，不属于 client/server 之间的
- * 线协议；线协议仍由 chat_common.h 定义，两者不要混在一起。
+ * 这里是“服务器内部存储”，不是 client<->server 的线协议（线协议在 chat_common.h）。
  *
- * 阶段 03 服务器仍是单进程单线程；这里的加锁是为阶段 04 的工作线程
- * 预留正确性，当前不证明并发。
+ * 在阶段 03 基础上新增：is_bot/login_time/logout_time、成功发送计数矩阵、
+ * 离线消息缓冲、在线名单快照、机器人增删等，支撑在线广播/离线回推/重要朋友/机器人管理。
  */
 
 #ifndef CHAT_USER_STORE_H
@@ -20,98 +20,133 @@
 
 #include "chat_common.h"
 
-/* 魔数 "CHUS"，仅用于排查共享内存内容是否是本程序写的。 */
-#define CHAT_USER_STORE_MAGIC   0x43485553u
-#define CHAT_USER_STORE_VERSION 1u
+#define CHAT_USER_STORE_MAGIC      0x43485553u   /* "CHUS" */
+#define CHAT_USER_STORE_VERSION    3u            /* 2026 版结构；v3 新增 session_id/session_seq */
+#define CHAT_MAX_OFFLINE_MESSAGES  256
+#define CHAT_IMPORTANT_FRIEND_MIN  5             /* 成功发送 > 5 次即为重要朋友 */
 
-/* 共享内存里的单条用户记录，字段与阶段 01/02 的 User 一致。 */
-typedef struct
-{
+/* 单条用户记录。 */
+typedef struct {
     char username[CHAT_NAME_LEN];
     char password[CHAT_PASSWORD_LEN];
-    char fifo[CHAT_FIFO_PATH_LEN];
+    char fifo[CHAT_FIFO_PATH_LEN];   /* 机器人无客户端 FIFO，留空 */
     int  online;
+    int  is_bot;
+    long login_time;                 /* 仅用于日志/展示，不再作为会话判定依据 */
+    long logout_time;
+    unsigned long session_id;        /* 每次成功登录递增的会话号，用于区分同一秒内的重新登录 */
 } ChatUserRecord;
 
-/*
- * 共享内存对象的整体布局：互斥锁放最前面，其后是元信息与记录数组。
- * mutex 保护 magic 之后（含 user_count 与 users[]）的所有可变字段。
- */
-typedef struct
-{
+/* 一条暂存的离线消息。 */
+typedef struct {
+    int  used;
+    char from[CHAT_NAME_LEN];
+    char to[CHAT_NAME_LEN];
+    char text[CHAT_TEXT_LEN];
+    long timestamp;                  /* 原始发送时间 */
+} ChatOfflineMessage;
+
+/* 共享内存对象整体布局：互斥锁在最前，保护其后所有可变字段。 */
+typedef struct {
     pthread_mutex_t mutex;
     unsigned int    magic;
     unsigned int    version;
     int             user_count;
+    unsigned int    rand_state;      /* 机器人随机名/密码用的 LCG 状态 */
+    unsigned long   bot_seq;         /* 机器人序号，保证用户名唯一 */
+    unsigned long   session_seq;     /* 全局单调递增的会话计数；每次成功登录 ++ 后赋给 session_id */
     ChatUserRecord  users[CHAT_MAX_USERS];
+    int             send_count[CHAT_MAX_USERS][CHAT_MAX_USERS]; /* [from][to] 成功次数 */
+    ChatOfflineMessage offline_messages[CHAT_MAX_OFFLINE_MESSAGES];
 } ChatUserStore;
 
-/* 进程内持有的句柄。store 指向 mmap 区，NULL 表示未初始化。 */
-typedef struct
-{
-    char           name[64];       /* 形如 "/chatroom_lwj_users" */
-    ChatUserStore *store;          /* mmap 映射地址 */
-    size_t         size;           /* 映射字节数 = sizeof(ChatUserStore) */
-    int            process_shared; /* 1=互斥锁成功设为 PROCESS_SHARED */
+/* 进程内句柄。 */
+typedef struct {
+    char           name[64];         /* "/chatroom_lwj_users" */
+    ChatUserStore *store;
+    size_t         size;
+    int            process_shared;   /* 1 = 互斥锁成功设为 PROCESS_SHARED */
 } UserStoreHandle;
 
-/* 注册/登录/登出操作的返回状态。 */
-typedef enum
-{
+typedef enum {
     USER_STORE_OK = 0,
-    USER_STORE_ERR_EXISTS,        /* 注册：用户名已存在 */
-    USER_STORE_ERR_FULL,          /* 注册：用户表已满 */
-    USER_STORE_ERR_NOT_FOUND,     /* 登录/登出：用户不存在 */
-    USER_STORE_ERR_BAD_PASSWORD,  /* 登录：密码错误 */
-    USER_STORE_ERR_FIFO_MISMATCH  /* 登出：fifo 与记录不一致（弱身份校验失败） */
+    USER_STORE_ERR_EXISTS,
+    USER_STORE_ERR_FULL,
+    USER_STORE_ERR_NOT_FOUND,
+    USER_STORE_ERR_BAD_PASSWORD,
+    USER_STORE_ERR_FIFO_MISMATCH
 } UserStoreStatus;
 
-/* 聊天投递前对用户表取一致快照的结果。 */
-typedef enum
-{
-    CHAT_PREP_OK = 0,
-    CHAT_PREP_SENDER_INVALID,  /* 发送方不存在或不在线：静默丢弃 */
-    CHAT_PREP_TARGET_MISSING,  /* 目标不存在 */
-    CHAT_PREP_TARGET_OFFLINE   /* 目标离线 */
-} ChatPrepStatus;
+/* prepare_send 的一致快照结果。 */
+typedef struct {
+    int  sender_online;
+    int  target_exists;
+    int  target_online;
+    int  target_is_bot;
+    char from_fifo[CHAT_FIFO_PATH_LEN];
+    char to_fifo[CHAT_FIFO_PATH_LEN];
+    int  send_count;                 /* 当前 send_count[from][to]（自增前） */
+    unsigned long target_session_id; /* 目标本次会话号快照，用于区分重新登录 */
+} ChatSendInfo;
 
-/*
- * 创建/映射/初始化共享内存用户表。short_name 用于派生对象名
- * （"/chatroom_<short_name>_users"）。每次启动都重置共享区。
- * 成功返回 0；失败返回 -1（errno 保留失败原因）。
- */
+/* ---- 生命周期 ---- */
 int  user_store_init(UserStoreHandle *h, const char *short_name);
-
-/* 解除映射并 shm_unlink。对零值/未初始化句柄是安全的 no-op。 */
 void user_store_destroy(UserStoreHandle *h);
 
-/*
- * 以下操作各自在内部完成加锁/解锁，锁的临界区只覆盖对用户表的查改；
- * 调用方应在锁外做 FIFO 回包这类慢/阻塞操作。
- */
+/* ---- 注册/登录/登出（均内部加锁）---- */
 UserStoreStatus user_store_register(UserStoreHandle *h, const char *username,
-                                    const char *password, const char *fifo);
+                                    const char *password, const char *fifo, int is_bot);
 UserStoreStatus user_store_login(UserStoreHandle *h, const char *username,
-                                 const char *password, const char *fifo);
+                                 const char *password, const char *fifo, long now);
 UserStoreStatus user_store_logout(UserStoreHandle *h, const char *username,
-                                  const char *fifo);
+                                  const char *fifo, long now);
 
-/*
- * 给聊天投递取一致快照：在一次加锁内校验发送方在线、目标在线，
- * 并把（只要发送方有效）发送方 fifo、（OK 时）目标 fifo 复制出来。
- * 之后的实际 FIFO 写在锁外进行。
- */
-ChatPrepStatus  user_store_prepare_chat(UserStoreHandle *h,
-                                        const char *from, const char *to,
-                                        char *from_fifo, size_t from_fifo_sz,
-                                        char *to_fifo, size_t to_fifo_sz);
+/* ---- 在线名单 ---- */
+/* 为 viewer 构造在线名单串 "u1,u2*,u3"（*=对 viewer 而言的重要朋友）。 */
+void user_store_build_online_list(UserStoreHandle *h, const char *viewer,
+                                  char *buf, size_t bufsz, int *online_count);
+/* 为每个“在线且有 FIFO 的真实客户端”构造个性化 ONLINE_LIST 包 + 其 FIFO。
+ * 返回填充数量；timestamp 由调用方在锁外补。 */
+int  user_store_build_online_broadcast(UserStoreHandle *h, ChatPacket *packets,
+                                       char fifos[][CHAT_FIFO_PATH_LEN], int max);
+/* 快照所有“在线且有 FIFO 的真实客户端”的 FIFO（可排除一个用户名）。 */
+int  user_store_snapshot_receiver_fifos(UserStoreHandle *h,
+                                        char fifos[][CHAT_FIFO_PATH_LEN], int max,
+                                        const char *exclude);
 
-/*
- * 投递失败后调用：仅当目标记录的 fifo 仍等于 fifo 时才把它置为离线，
- * 避免误伤在投递间隙用同名重新登录、换了新 fifo 的用户。
- * 返回 1 表示已置离线，0 表示记录已变化或不存在。
- */
-int user_store_mark_offline_if_fifo(UserStoreHandle *h,
-                                    const char *username, const char *fifo);
+/* ---- 发送/计数/离线 ---- */
+void user_store_prepare_send(UserStoreHandle *h, const char *from, const char *to,
+                             ChatSendInfo *out);
+/* 成功投递后自增 send_count[from][to]，返回新值；任一方不存在返回 -1。 */
+int  user_store_increment_send(UserStoreHandle *h, const char *from, const char *to);
+/* 投递失败后：仅当目标仍是同一会话（username 匹配、fifo 与 session_id 均等于发送前快照、
+ * 且当前仍 online）时才置离线，返回 1 表示已置离线；返回 0 说明目标已用新会话重新登录，
+ * 不应误置离线。 */
+int  user_store_mark_offline_if_session(UserStoreHandle *h, const char *username,
+                                        const char *fifo, unsigned long session_id);
+/* 暂存一条离线消息（仅对真实离线用户调用）。 */
+UserStoreStatus user_store_store_offline(UserStoreHandle *h, const char *from,
+                                         const char *to, const char *text, long timestamp);
+/* 快照发给 user 的离线消息但【不清除】，最多 max 条；slots[i] 记录第 i 条所在的槽位下标，
+ * 供投递成功后精确清除。返回条数。与 user_store_clear_offline 配合，保证 FIFO 写失败不丢消息。 */
+int  user_store_peek_offline(UserStoreHandle *h, const char *user,
+                             ChatOfflineMessage *out, int *slots, int max);
+/* 投递成功后清除 slot 槽位的离线消息；仅当该槽仍 used 且 from/to/timestamp/text 与 expect 全部
+ * 一致时才清除（避免并发下误删被复用的槽，也避免同一秒同 from/to 的不同消息被误判为同一条），
+ * 返回 1 表示已清除，返回 0 表示该槽已被并发清掉/复用。 */
+int  user_store_clear_offline(UserStoreHandle *h, int slot, const ChatOfflineMessage *expect);
+/* 查 username 的 fifo，找到返回 1 并复制到 buf。 */
+int  user_store_lookup_fifo(UserStoreHandle *h, const char *username,
+                            char *buf, size_t bufsz);
+/* 机器人管理鉴权：仅当 username 存在、在线、非机器人且 fifo 非空时返回 1 并复制 fifo。 */
+int  user_store_lookup_online_client_fifo(UserStoreHandle *h, const char *username,
+                                          char *buf, size_t bufsz);
+
+/* ---- 机器人 ---- */
+/* 创建一个随机用户名/密码的在线机器人（is_bot=1, online=1），名字写入 out_name。 */
+UserStoreStatus user_store_add_bot(UserStoreHandle *h, char *out_name, size_t out_sz, long now);
+/* 随机选最多 x 个在线机器人置为离线，名字写入 names，返回实际数量。 */
+int  user_store_pick_online_bots(UserStoreHandle *h, int x,
+                                 char names[][CHAT_NAME_LEN], int max, long now);
 
 #endif

@@ -278,7 +278,7 @@ static void handle_register(const ChatAuthRequest *req)
         return;
     }
 
-    st = user_store_register(&g_store, req->username, req->password, req->fifo);
+    st = user_store_register(&g_store, req->username, req->password, req->fifo, 0);
     switch (st)
     {
     case USER_STORE_OK:
@@ -301,7 +301,7 @@ static void handle_register(const ChatAuthRequest *req)
 static void handle_login(const ChatAuthRequest *req)
 {
     UserStoreStatus st = user_store_login(&g_store, req->username,
-                                          req->password, req->fifo);
+                                          req->password, req->fifo, (long)time(NULL));
     switch (st)
     {
     case USER_STORE_OK:
@@ -324,7 +324,7 @@ static void handle_login(const ChatAuthRequest *req)
  * 用户不存在或 fifo 不匹配时静默丢弃，与阶段 01/02 行为一致。 */
 static void handle_logout(const ChatLogoutRequest *req)
 {
-    UserStoreStatus st = user_store_logout(&g_store, req->username, req->fifo);
+    UserStoreStatus st = user_store_logout(&g_store, req->username, req->fifo, (long)time(NULL));
     if (st != USER_STORE_OK) return;   /* NOT_FOUND / FIFO_MISMATCH：沉默丢弃 */
     reply_to_fifo(req->fifo, 1, "logout ok");
     log_message("INFO", "logout user: %s", req->username);
@@ -332,42 +332,40 @@ static void handle_logout(const ChatLogoutRequest *req)
 
 static void handle_chat(const ChatSendRequest *req)
 {
-    char       from_fifo[CHAT_FIFO_PATH_LEN];
-    char       to_fifo[CHAT_FIFO_PATH_LEN];
     ChatPacket packet;
     char       message[CHAT_TEXT_LEN];
-    ChatPrepStatus prep;
+    ChatSendInfo info;
 
     /* 一次加锁内取一致快照：发送方在线、目标存在且在线，复制双方 fifo。 */
-    prep = user_store_prepare_chat(&g_store, req->from, req->to,
-                                   from_fifo, sizeof(from_fifo),
-                                   to_fifo, sizeof(to_fifo));
-    switch (prep)
+    user_store_prepare_send(&g_store, req->from, req->to, &info);
+    if (!info.sender_online)
     {
-    case CHAT_PREP_SENDER_INVALID:
         return;   /* 发送方不存在/不在线：静默丢弃 */
-    case CHAT_PREP_TARGET_MISSING:
-        reply_to_fifo(from_fifo, 0, "target user does not exist");
+    }
+    if (!info.target_exists)
+    {
+        reply_to_fifo(info.from_fifo, 0, "target user does not exist");
         return;
-    case CHAT_PREP_TARGET_OFFLINE:
-        reply_to_fifo(from_fifo, 0, "target user is not online");
+    }
+    if (!info.target_online)
+    {
+        reply_to_fifo(info.from_fifo, 0, "target user is not online");
         return;
-    case CHAT_PREP_OK:
-        break;
     }
 
     /* FIFO 写在锁外进行。 */
     make_packet(&packet, CHAT_PACKET_MESSAGE, 1, req->from, req->text);
-    if (send_packet(to_fifo, &packet) == -1)
+    if (send_packet(info.to_fifo, &packet) == -1)
     {
-        /* 投递失败：仅当目标记录仍指向同一 fifo 时才置离线，避免误伤期间重新登录者。 */
-        if (user_store_mark_offline_if_fifo(&g_store, req->to, to_fifo))
+        /* 投递失败：仅当目标仍是同一会话时才置离线，避免误伤期间重新登录者。 */
+        if (user_store_mark_offline_if_session(&g_store, req->to, info.to_fifo,
+                                               info.target_session_id))
             log_message("WARN", "target fifo unavailable for %s, marked offline", req->to);
-        reply_to_fifo(from_fifo, 0, "target fifo is not available");
+        reply_to_fifo(info.from_fifo, 0, "target fifo is not available");
         return;
     }
     snprintf(message, sizeof(message), "message sent to %s", req->to);
-    reply_to_fifo(from_fifo, 1, message);
+    reply_to_fifo(info.from_fifo, 1, message);
     log_message("INFO", "%s -> %s: %s", req->from, req->to, req->text);
 }
 

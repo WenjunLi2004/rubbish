@@ -1,16 +1,11 @@
 /*
  * user_store.c
  *
- * 阶段 03：POSIX 共享内存用户表 + 进程间互斥锁的实现。
- *
- * 步骤：shm_open(O_CREAT) → fchmod(0600) → ftruncate → mmap →
- * 在共享区内用 PTHREAD_PROCESS_SHARED 属性初始化互斥锁，并写入
- * magic/version/user_count。所有对 user_count 与 users[] 的访问都在
- * 这把锁的保护下完成。
- *
- * 设计取舍：把“查找/插入/改状态”这类临界区操作封装在本文件里、
- * 内部自管加解锁，chatserver.c 的 handler 只拿返回值、在锁外做 FIFO
- * 回包。这样既保证锁范围最小，也避免上层忘记解锁。
+ * 共享内存用户表实现（2026 试题对齐版）。
+ * 初始化：shm_open(O_CREAT) -> fchmod(0600) -> ftruncate -> mmap ->
+ * 在共享区内用 PTHREAD_PROCESS_SHARED 初始化互斥锁 -> 写 magic/version。
+ * 所有对 user_count/users[]/send_count/offline_messages 的访问都在锁内完成；
+ * 调用方把要用于 FIFO 写的数据复制到本地快照后，在锁外做 FIFO I/O。
  */
 
 #include "user_store.h"
@@ -22,9 +17,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
-/* 安全字符串拷贝：保证 '\0' 结尾，超长截断。 */
 static void copy_string(char *dst, size_t dst_size, const char *src)
 {
     snprintf(dst, dst_size, "%s", src == NULL ? "" : src);
@@ -33,13 +28,41 @@ static void copy_string(char *dst, size_t dst_size, const char *src)
 static void su_lock(UserStoreHandle *h)   { pthread_mutex_lock(&h->store->mutex); }
 static void su_unlock(UserStoreHandle *h) { pthread_mutex_unlock(&h->store->mutex); }
 
-/* 在已持锁的前提下按用户名查找，返回下标或 -1。 */
 static int find_locked(const ChatUserStore *s, const char *username)
 {
     int i;
+    if (!username || !username[0]) return -1;
     for (i = 0; i < s->user_count; i++)
         if (strcmp(s->users[i].username, username) == 0) return i;
     return -1;
+}
+
+/* 共享区内的简单 LCG，调用前须持锁。 */
+static unsigned lcg_next(ChatUserStore *s)
+{
+    s->rand_state = s->rand_state * 1103515245u + 12345u;
+    return (s->rand_state >> 16) & 0x7fffu;
+}
+
+/* 持锁前提下为 viewer（下标 vi，可为 -1）构造在线名单串，并回填在线总数。 */
+static void build_list_locked(const ChatUserStore *s, int vi,
+                              char *buf, size_t bufsz, int *online_count)
+{
+    int i, count = 0;
+    size_t off = 0;
+    if (bufsz) buf[0] = '\0';
+    for (i = 0; i < s->user_count; i++)
+    {
+        int important, n;
+        if (!s->users[i].online) continue;
+        count++;
+        important = (vi >= 0 && i != vi && s->send_count[vi][i] > CHAT_IMPORTANT_FRIEND_MIN);
+        n = snprintf(buf + off, bufsz - off, "%s%s%s",
+                     off ? "," : "", s->users[i].username, important ? "*" : "");
+        if (n > 0 && (size_t)n < bufsz - off) off += (size_t)n;
+        else { off = bufsz ? bufsz - 1 : 0; }  /* 截断保护：名单过长则停止追加 */
+    }
+    if (online_count) *online_count = count;
 }
 
 int user_store_init(UserStoreHandle *h, const char *short_name)
@@ -60,33 +83,23 @@ int user_store_init(UserStoreHandle *h, const char *short_name)
     fd = shm_open(name, O_CREAT | O_RDWR, 0600);
     if (fd == -1) return -1;
 
-    /* 已存在的对象可能权限较松，尽量用 fchmod 收紧到 0600（与 server.log 的 fchmod 同理）。
-     * 少数平台（如 macOS）对 shm fd 的 fchmod 返回 EINVAL：此时退而用 fstat 确认对象
-     * 未对组/其他开放（newly created 时本就是 0600）；只要不超出 0600 即可继续，否则判失败。
-     * 目标环境 Linux euler 上 fchmod 正常生效，强制收紧。 */
     if (fchmod(fd, 0600) == -1)
     {
         struct stat st;
         if (fstat(fd, &st) == -1) goto fail;
-        if ((st.st_mode & 077) != 0) { errno = EPERM; goto fail; }  /* 太松又改不动：失败 */
+        if ((st.st_mode & 077) != 0) { errno = EPERM; goto fail; }
     }
 
     if (ftruncate(fd, (off_t)sizeof(ChatUserStore)) == -1) goto fail;
 
-    s = mmap(NULL, sizeof(ChatUserStore), PROT_READ | PROT_WRITE,
-             MAP_SHARED, fd, 0);
+    s = mmap(NULL, sizeof(ChatUserStore), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (s == MAP_FAILED) goto fail;
-
-    close(fd);   /* 映射建立后 fd 不再需要 */
+    close(fd);
     fd = -1;
 
-    /* 每次启动都重置共享区：与旧版全局数组“重启即清空”的语义一致，
-     * 也能覆盖上一个被 kill -9 的守护进程残留下来的陈旧对象。 */
     memset(s, 0, sizeof(*s));
 
     if (pthread_mutexattr_init(&attr) != 0) goto fail_unmap;
-    /* 把锁设为进程间共享是本阶段的核心。失败（如 macOS 不支持）不致命：
-     * 退回进程私有锁，由调用方在日志里说明；Linux euler 上应成功。 */
     if (pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) == 0)
         pshared_ok = 1;
     rc = pthread_mutex_init(&s->mutex, &attr);
@@ -96,6 +109,9 @@ int user_store_init(UserStoreHandle *h, const char *short_name)
     s->magic = CHAT_USER_STORE_MAGIC;
     s->version = CHAT_USER_STORE_VERSION;
     s->user_count = 0;
+    s->bot_seq = 0;
+    s->session_seq = 0;
+    s->rand_state = (unsigned)(time(NULL) ^ (long)getpid() ^ 0x9e3779b9u);
 
     copy_string(h->name, sizeof(h->name), name);
     h->store = s;
@@ -109,7 +125,7 @@ fail:
     {
         int saved = errno;
         if (fd != -1) close(fd);
-        shm_unlink(name);   /* 本次创建/打开失败，尽量不残留对象 */
+        shm_unlink(name);
         errno = saved;
     }
     return -1;
@@ -131,7 +147,7 @@ void user_store_destroy(UserStoreHandle *h)
 }
 
 UserStoreStatus user_store_register(UserStoreHandle *h, const char *username,
-                                    const char *password, const char *fifo)
+                                    const char *password, const char *fifo, int is_bot)
 {
     ChatUserStore  *s = h->store;
     UserStoreStatus ret;
@@ -144,10 +160,12 @@ UserStoreStatus user_store_register(UserStoreHandle *h, const char *username,
     else
     {
         ChatUserRecord *r = &s->users[s->user_count];
+        memset(r, 0, sizeof(*r));
         copy_string(r->username, sizeof(r->username), username);
         copy_string(r->password, sizeof(r->password), password);
         copy_string(r->fifo, sizeof(r->fifo), fifo);
         r->online = 0;
+        r->is_bot = is_bot ? 1 : 0;
         s->user_count++;
         ret = USER_STORE_OK;
     }
@@ -156,7 +174,7 @@ UserStoreStatus user_store_register(UserStoreHandle *h, const char *username,
 }
 
 UserStoreStatus user_store_login(UserStoreHandle *h, const char *username,
-                                 const char *password, const char *fifo)
+                                 const char *password, const char *fifo, long now)
 {
     ChatUserStore  *s = h->store;
     UserStoreStatus ret;
@@ -172,6 +190,8 @@ UserStoreStatus user_store_login(UserStoreHandle *h, const char *username,
     {
         copy_string(s->users[idx].fifo, sizeof(s->users[idx].fifo), fifo);
         s->users[idx].online = 1;
+        s->users[idx].login_time = now;
+        s->users[idx].session_id = ++s->session_seq;
         ret = USER_STORE_OK;
     }
     su_unlock(h);
@@ -179,7 +199,7 @@ UserStoreStatus user_store_login(UserStoreHandle *h, const char *username,
 }
 
 UserStoreStatus user_store_logout(UserStoreHandle *h, const char *username,
-                                  const char *fifo)
+                                  const char *fifo, long now)
 {
     ChatUserStore  *s = h->store;
     UserStoreStatus ret;
@@ -194,59 +214,283 @@ UserStoreStatus user_store_logout(UserStoreHandle *h, const char *username,
     else
     {
         s->users[idx].online = 0;
+        s->users[idx].logout_time = now;
         ret = USER_STORE_OK;
     }
     su_unlock(h);
     return ret;
 }
 
-ChatPrepStatus user_store_prepare_chat(UserStoreHandle *h,
-                                       const char *from, const char *to,
-                                       char *from_fifo, size_t from_fifo_sz,
-                                       char *to_fifo, size_t to_fifo_sz)
+void user_store_build_online_list(UserStoreHandle *h, const char *viewer,
+                                  char *buf, size_t bufsz, int *online_count)
 {
     ChatUserStore *s = h->store;
-    ChatPrepStatus ret;
-    int            fi, ti;
-
     su_lock(h);
-    fi = find_locked(s, from);
-    if (fi < 0 || !s->users[fi].online)
-    {
-        ret = CHAT_PREP_SENDER_INVALID;
-        goto out;
-    }
-    copy_string(from_fifo, from_fifo_sz, s->users[fi].fifo);
-
-    ti = find_locked(s, to);
-    if (ti < 0)
-        ret = CHAT_PREP_TARGET_MISSING;
-    else if (!s->users[ti].online)
-        ret = CHAT_PREP_TARGET_OFFLINE;
-    else
-    {
-        copy_string(to_fifo, to_fifo_sz, s->users[ti].fifo);
-        ret = CHAT_PREP_OK;
-    }
-out:
+    build_list_locked(s, find_locked(s, viewer), buf, bufsz, online_count);
     su_unlock(h);
-    return ret;
 }
 
-int user_store_mark_offline_if_fifo(UserStoreHandle *h,
-                                    const char *username, const char *fifo)
+int user_store_build_online_broadcast(UserStoreHandle *h, ChatPacket *packets,
+                                      char fifos[][CHAT_FIFO_PATH_LEN], int max)
 {
     ChatUserStore *s = h->store;
-    int            marked = 0;
-    int            idx;
+    int i, n = 0, total = 0;
 
     su_lock(h);
+    for (i = 0; i < s->user_count; i++) if (s->users[i].online) total++;
+    for (i = 0; i < s->user_count && n < max; i++)
+    {
+        ChatPacket *p;
+        if (!s->users[i].online || s->users[i].fifo[0] == '\0') continue; /* 跳过机器人/无 FIFO */
+        p = &packets[n];
+        memset(p, 0, sizeof(*p));
+        p->type = CHAT_PACKET_ONLINE_LIST;
+        p->ok = 1;
+        copy_string(p->from, sizeof(p->from), "server");
+        build_list_locked(s, i, p->message, sizeof(p->message), NULL);
+        p->online_count = total;
+        copy_string(fifos[n], CHAT_FIFO_PATH_LEN, s->users[i].fifo);
+        n++;
+    }
+    su_unlock(h);
+    return n;
+}
+
+int user_store_snapshot_receiver_fifos(UserStoreHandle *h,
+                                       char fifos[][CHAT_FIFO_PATH_LEN], int max,
+                                       const char *exclude)
+{
+    ChatUserStore *s = h->store;
+    int i, n = 0;
+
+    su_lock(h);
+    for (i = 0; i < s->user_count && n < max; i++)
+    {
+        if (!s->users[i].online || s->users[i].fifo[0] == '\0') continue;
+        if (exclude && exclude[0] && strcmp(s->users[i].username, exclude) == 0) continue;
+        copy_string(fifos[n], CHAT_FIFO_PATH_LEN, s->users[i].fifo);
+        n++;
+    }
+    su_unlock(h);
+    return n;
+}
+
+void user_store_prepare_send(UserStoreHandle *h, const char *from, const char *to,
+                             ChatSendInfo *out)
+{
+    ChatUserStore *s = h->store;
+    int fi, ti;
+
+    memset(out, 0, sizeof(*out));
+    su_lock(h);
+    fi = find_locked(s, from);
+    if (fi >= 0)
+    {
+        out->sender_online = s->users[fi].online;
+        copy_string(out->from_fifo, sizeof(out->from_fifo), s->users[fi].fifo);
+    }
+    ti = find_locked(s, to);
+    if (ti >= 0)
+    {
+        out->target_exists = 1;
+        out->target_online = s->users[ti].online;
+        out->target_is_bot = s->users[ti].is_bot;
+        out->target_session_id = s->users[ti].session_id;
+        copy_string(out->to_fifo, sizeof(out->to_fifo), s->users[ti].fifo);
+    }
+    if (fi >= 0 && ti >= 0) out->send_count = s->send_count[fi][ti];
+    su_unlock(h);
+}
+
+int user_store_increment_send(UserStoreHandle *h, const char *from, const char *to)
+{
+    ChatUserStore *s = h->store;
+    int fi, ti, val = -1;
+    su_lock(h);
+    fi = find_locked(s, from);
+    ti = find_locked(s, to);
+    if (fi >= 0 && ti >= 0) val = ++s->send_count[fi][ti];
+    su_unlock(h);
+    return val;
+}
+
+int user_store_mark_offline_if_session(UserStoreHandle *h, const char *username,
+                                       const char *fifo, unsigned long session_id)
+{
+    ChatUserStore *s = h->store;
+    int idx, marked = 0;
+    su_lock(h);
     idx = find_locked(s, username);
-    if (idx >= 0 && strcmp(s->users[idx].fifo, fifo) == 0)
+    /* 仅当目标仍是同一会话才置离线：username 匹配（idx>=0）、当前仍 online、session_id 与
+     * fifo 都等于发送前的快照。私有 FIFO 按用户名派生，重新登录后路径通常相同，单看 fifo
+     * 无法区分新旧会话；session_id 每次成功登录单调递增，可避免同一秒重新登录被误判为同一会话。 */
+    if (idx >= 0 && s->users[idx].online &&
+        s->users[idx].session_id == session_id &&
+        strcmp(s->users[idx].fifo, fifo) == 0)
     {
         s->users[idx].online = 0;
         marked = 1;
     }
     su_unlock(h);
     return marked;
+}
+
+UserStoreStatus user_store_store_offline(UserStoreHandle *h, const char *from,
+                                         const char *to, const char *text, long timestamp)
+{
+    ChatUserStore  *s = h->store;
+    UserStoreStatus ret = USER_STORE_ERR_FULL;
+    int i;
+    su_lock(h);
+    for (i = 0; i < CHAT_MAX_OFFLINE_MESSAGES; i++)
+    {
+        if (s->offline_messages[i].used) continue;
+        s->offline_messages[i].used = 1;
+        copy_string(s->offline_messages[i].from, CHAT_NAME_LEN, from);
+        copy_string(s->offline_messages[i].to, CHAT_NAME_LEN, to);
+        copy_string(s->offline_messages[i].text, CHAT_TEXT_LEN, text);
+        s->offline_messages[i].timestamp = timestamp;
+        ret = USER_STORE_OK;
+        break;
+    }
+    su_unlock(h);
+    return ret;
+}
+
+int user_store_peek_offline(UserStoreHandle *h, const char *user,
+                            ChatOfflineMessage *out, int *slots, int max)
+{
+    ChatUserStore *s = h->store;
+    int i, n = 0;
+    su_lock(h);
+    for (i = 0; i < CHAT_MAX_OFFLINE_MESSAGES && n < max; i++)
+    {
+        if (!s->offline_messages[i].used) continue;
+        if (strcmp(s->offline_messages[i].to, user) != 0) continue;
+        out[n] = s->offline_messages[i];
+        slots[n] = i;                /* 记录槽位，投递成功后据此精确清除 */
+        n++;
+    }
+    su_unlock(h);
+    return n;
+}
+
+int user_store_clear_offline(UserStoreHandle *h, int slot, const ChatOfflineMessage *expect)
+{
+    ChatUserStore *s = h->store;
+    int cleared = 0;
+    if (slot < 0 || slot >= CHAT_MAX_OFFLINE_MESSAGES) return 0;
+    su_lock(h);
+    {
+        ChatOfflineMessage *m = &s->offline_messages[slot];
+        /* 仅当该槽仍是当初快照的同一条消息时才清除，避免并发下误删被复用的槽；同时比较 text，
+         * 避免同一秒同 from/to 的不同消息在并发场景下被误判为同一条。 */
+        if (m->used && m->timestamp == expect->timestamp &&
+            strcmp(m->from, expect->from) == 0 &&
+            strcmp(m->to, expect->to) == 0 &&
+            strcmp(m->text, expect->text) == 0)
+        {
+            m->used = 0;
+            cleared = 1;
+        }
+    }
+    su_unlock(h);
+    return cleared;
+}
+
+int user_store_lookup_fifo(UserStoreHandle *h, const char *username,
+                           char *buf, size_t bufsz)
+{
+    ChatUserStore *s = h->store;
+    int idx, found = 0;
+    su_lock(h);
+    idx = find_locked(s, username);
+    if (idx >= 0) { copy_string(buf, bufsz, s->users[idx].fifo); found = 1; }
+    su_unlock(h);
+    return found;
+}
+
+int user_store_lookup_online_client_fifo(UserStoreHandle *h, const char *username,
+                                         char *buf, size_t bufsz)
+{
+    ChatUserStore *s = h->store;
+    int idx, found = 0;
+    su_lock(h);
+    idx = find_locked(s, username);
+    /* 只有“在线 + 非机器人 + 有私有 FIFO”的真实客户端用户才算合法的机器人管理发起者。 */
+    if (idx >= 0 && s->users[idx].online && !s->users[idx].is_bot &&
+        s->users[idx].fifo[0] != '\0')
+    {
+        copy_string(buf, bufsz, s->users[idx].fifo);
+        found = 1;
+    }
+    su_unlock(h);
+    return found;
+}
+
+UserStoreStatus user_store_add_bot(UserStoreHandle *h, char *out_name, size_t out_sz, long now)
+{
+    ChatUserStore  *s = h->store;
+    UserStoreStatus ret;
+
+    su_lock(h);
+    if (s->user_count >= CHAT_MAX_USERS)
+        ret = USER_STORE_ERR_FULL;
+    else
+    {
+        ChatUserRecord *r;
+        char name[CHAT_NAME_LEN];
+        char pw[CHAT_PASSWORD_LEN];
+        int  tries = 0;
+        do {
+            unsigned long seq = ++s->bot_seq;
+            snprintf(name, sizeof(name), "lwjbot_%lu_%u", seq, lcg_next(s) % 1000u);
+        } while (find_locked(s, name) != -1 && ++tries < 64);
+        snprintf(pw, sizeof(pw), "bp%u%u", lcg_next(s), lcg_next(s));
+
+        r = &s->users[s->user_count];
+        memset(r, 0, sizeof(*r));
+        copy_string(r->username, sizeof(r->username), name);
+        copy_string(r->password, sizeof(r->password), pw);
+        r->fifo[0] = '\0';            /* 机器人无客户端 FIFO */
+        r->online = 1;
+        r->is_bot = 1;
+        r->login_time = now;
+        r->session_id = ++s->session_seq;
+        s->user_count++;
+        copy_string(out_name, out_sz, name);
+        ret = USER_STORE_OK;
+    }
+    su_unlock(h);
+    return ret;
+}
+
+int user_store_pick_online_bots(UserStoreHandle *h, int x,
+                                char names[][CHAT_NAME_LEN], int max, long now)
+{
+    ChatUserStore *s = h->store;
+    int idxs[CHAT_MAX_USERS];
+    int i, m = 0, want, k, n = 0;
+
+    su_lock(h);
+    for (i = 0; i < s->user_count; i++)
+        if (s->users[i].online && s->users[i].is_bot) idxs[m++] = i;
+
+    want = x;
+    if (want > m) want = m;
+    if (want > max) want = max;
+
+    for (k = 0; k < want; k++)
+    {
+        int r = k + (int)(lcg_next(s) % (unsigned)(m - k));   /* 部分 Fisher-Yates */
+        int bi = idxs[r];
+        idxs[r] = idxs[k];
+        idxs[k] = bi;
+        s->users[bi].online = 0;
+        s->users[bi].logout_time = now;
+        copy_string(names[n], CHAT_NAME_LEN, s->users[bi].username);
+        n++;
+    }
+    su_unlock(h);
+    return n;
 }
