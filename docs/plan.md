@@ -1,5 +1,13 @@
 # 大作业实施计划（选题一·功能迭代）
 
+> ⚠️ **本 11 阶段计划已被 2026 新版试题取代（SUPERSEDED）。**
+> 课程 PDF（`2026系统编程大作业试题.pdf`）改版后，服务器已一次性对齐新要求：
+> 二进制 `chatserver_lwj_1.0`、公共 FIFO `~/Server/fifo/lwj_*_fifo`、日志 `~/log/chat-logs`、
+> `POOLSIZE=100` 真实线程池（LIFO 空闲栈）、在线名单广播、离线消息暂存回推、
+> 重要朋友 `*`、机器人管理。原先“线程池留到阶段 9 / 离线消息留到阶段 8”等分阶段约束已作废。
+> 实现说明见 `docs/answer-notes/2026-compliance.md`，演示见 `scripts/demo/2026-demo.md`，
+> 验证用 `make smoke`（`scripts/smoke/smoke-2026.sh`）。下文保留原计划仅作历史参考。
+
 ## 项目元信息
 
 | 项 | 值 |

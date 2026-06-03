@@ -1,4 +1,10 @@
-# 通信协议（v1.2.0 目标版）
+# 通信协议（2026 试题对齐版）
+
+> **2026 对齐说明**：公共 FIFO 改名为 `~/Server/fifo/lwj_{reg,login,msg,logout}_fifo`；
+> 二进制 `chatserver_lwj_1.0`；`CHAT_TEXT_LEN` 提升到 512（在线名单更长，仍远小于
+> PIPE_BUF=4096，单包 write 在 FIFO 上保持原子）；`ChatPacket` 尾部新增
+> `timestamp/send_count/online_count`，新增包类型 `ONLINE_LIST/OFFLINE_PUSH/SYSTEM`；
+> 机器人管理复用 MSG_FIFO（`to=__botmgr__`），不新增第 5 个公共 FIFO。
 
 > 一切请求与回复都是**定长二进制结构体**，通过命名管道传输。
 > 服务器和客户端都包含 `chat_common.h`，**严禁两端结构体定义不一致**。
@@ -10,10 +16,10 @@
 
 | 名 | 路径 | 客户端写入 | mkfifo 模式 |
 |---|---|---|---|
-| REG_FIFO | `<data>/server_fifo/lwjregister` | `ChatAuthRequest` | 0666 |
-| LOGIN_FIFO | `<data>/server_fifo/lwjlogin` | `ChatAuthRequest` | 0666 |
-| MSG_FIFO | `<data>/server_fifo/lwjsendmsg` | `ChatSendRequest` | 0666 |
-| LOGOUT_FIFO | `<data>/server_fifo/lwjlogout` | `ChatLogoutRequest` | 0666 |
+| REG_FIFO | `~/Server/fifo/lwj_reg_fifo` | `ChatAuthRequest` | 0666 |
+| LOGIN_FIFO | `~/Server/fifo/lwj_login_fifo` | `ChatAuthRequest` | 0666 |
+| MSG_FIFO | `~/Server/fifo/lwj_msg_fifo` | `ChatSendRequest`（机器人管理 `to=__botmgr__` 复用此 FIFO） | 0666 |
+| LOGOUT_FIFO | `~/Server/fifo/lwj_logout_fifo` | `ChatLogoutRequest` | 0666 |
 
 服务器创建 FIFO 前必须 `umask(0)`，否则 0666 会被默认 umask 022 砍成 0644，客户端就写不进去。
 
@@ -68,24 +74,25 @@ typedef struct {
 ```c
 typedef enum {
     CHAT_PACKET_REPLY        = 1, // 服务器对某个请求的应答
-    CHAT_PACKET_MESSAGE      = 2, // 别人发来的实时聊天消息
-    CHAT_PACKET_ONLINE_LIST  = 3, // 在线用户列表广播（v1.0.0 新增）
-    CHAT_PACKET_OFFLINE_PUSH = 4, // 重新登录后的离线消息回推（v1.0.0 新增）
+    CHAT_PACKET_MESSAGE      = 2, // 别人发来的实时聊天消息（含机器人回复）
+    CHAT_PACKET_ONLINE_LIST  = 3, // 在线人数 + 名单广播
+    CHAT_PACKET_OFFLINE_PUSH = 4, // 重新登录后的离线消息回推（带原始时间）
+    CHAT_PACKET_SYSTEM       = 5, // 系统事件：登入/登出/机器人增减
 } ChatPacketType;
 
 typedef struct {
     int  type;                      // ChatPacketType
     int  ok;                        // REPLY: 1=成功 0=失败；其他类型固定 1
     char from[CHAT_NAME_LEN];       // 消息来源；server 端回包用 "server"
-    char message[CHAT_TEXT_LEN];    // 文本载荷
-    long timestamp;                 // (新) 服务器侧 time(NULL)；OFFLINE_PUSH 必填
-    int  send_count;                // (新) from→to 的累计成功次数（含本次）
-    int  reserved;                  // 对齐占位，保留 0；客户端忽略其值
+    char message[CHAT_TEXT_LEN];    // 文本载荷 / 在线名单 "u1,u2*,u3"
+    long timestamp;                 // 服务器侧 time(NULL)；OFFLINE_PUSH 为原始发送时间
+    int  send_count;                // from→to 的累计成功次数（含本次）
+    int  online_count;              // 在线总数（ONLINE_LIST / 登录回执）
 } ChatPacket;
 ```
 
-**预计 sizeof = 312 字节**（int×3 + char×288 + long×1 + int×1，4 字节对齐）。
-实际值由 agent 在 stage 1 末尾打印 `sizeof(ChatPacket)` 写入本文档。
+`CHAT_TEXT_LEN=512`。计算 `sizeof(ChatPacket) = 4+4+32+512+8+4+4 = 568`（8 字节对齐）。
+实测值由服务器启动时打印进 `server.log`（`sizeof(ChatPacket)=...`）。
 
 ### 为什么不为每种 type 单独定义结构体
 
@@ -135,27 +142,29 @@ B 重新登录：
 # === 服务器身份 ===
 server_name = chatserver
 short_name  = lwj
-version     = 1.0.0
+version     = 1.0
 
-# === 路径 ===
-data_dir    = /home/liwenjun2023150001/ChatRoom/data
-log_dir     = /var/log/chat-logs
+# === 路径（2026）===
+fifo_dir        = /home/liwenjun2023150001/Server/fifo
+client_fifo_dir = /home/liwenjun2023150001/Client/fifo
+log_dir         = /home/liwenjun2023150001/log/chat-logs
 
-# === FIFO 命名 ===
+# === FIFO 命名前缀 ===
 fifo_prefix = lwj
 
-# === 线程池（阶段 9 起生效） ===
-poolsize    = 10
+# === 线程池 ===
+poolsize    = 100
 ```
 
 服务器启动时：
 - 解析失败 → 立即 exit(1)，并向 stderr 打印错误（此时 server.log 尚未打开）
-- 解析成功 → printf 当前生效配置到 stdout
+- 解析成功 → 守护化、打开日志，把生效配置写入 `server.log`
 
 派生字段（解析完成后由 `chat_config_load` 自动填充）：
-- `full_name = "chatserver_lwj_1.0.0"`
-- `fifo_register = <data_dir>/server_fifo/lwjregister`
-- 其他三个 FIFO 同理
+- `full_name = "chatserver_lwj_1.0"`
+- `fifo_register = <fifo_dir>/lwj_reg_fifo`，其余三个同理（`_login_/_msg_/_logout_`）
+- `server_log_path  = <log_dir>/server/server.log`
+- `threads_log_path = <log_dir>/server/threads.log`
 
 ## 七、版本演进与兼容性
 
@@ -169,12 +178,12 @@ poolsize    = 10
 阶段 01 实测（编译器 gcc 11.x，x86_64 SysV ABI，4 字节对齐）：
 
 ```
-sizeof(ChatAuthRequest)   = 32 + 32 + 256              = 320  ✓
-sizeof(ChatSendRequest)   = 32 + 32 + 256              = 320  ✓
-sizeof(ChatLogoutRequest) = 32 + 256                   = 288  ✓
-sizeof(ChatPacket)        = 4 + 4 + 32 + 256           = 296  ← v1.0.0
+sizeof(ChatAuthRequest)   = 32 + 32 + 256                  = 320
+sizeof(ChatSendRequest)   = 32 + 32 + 512                  = 576
+sizeof(ChatLogoutRequest) = 32 + 256                       = 288
+sizeof(ChatPacket)        = 4 + 4 + 32 + 512 + 8 + 4 + 4   = 568
 ```
 
-注：上表 `ChatPacket=296` 对应当前 v1.0.0（仅 type/ok/from/message 四字段）。
-v1.2.0 目标版会在尾部追加 `timestamp(long)/send_count(int)/reserved(int)`，
-理论 `4+4+32+256+8+4+4 = 312`，届时阶段重新打印实测值回填本节。
+注：`CHAT_TEXT_LEN` 由 256 提升到 512（在线名单更长）。所有定长结构体仍 < PIPE_BUF(4096)，
+单次 `write` 在 FIFO 上保持原子，并发工作线程写同一客户端 FIFO 不会交错。实测以
+`server.log` 启动横幅为准。
